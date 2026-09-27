@@ -296,11 +296,11 @@
   display: none;
 }
 
-.math-variable-row .math-color-picker-wrapper,
-.math-variable-row .math-row-visibility,
-.math-variable-row .math-row-label,
+.math-variable-row > .math-color-picker-wrapper,
+.math-variable-row > .math-row-visibility,
+.math-variable-row > .math-row-label,
 .math-hidden {
-  display: none !important;
+  display: none;
 }
 
 .math-variable-row .math-row-body {

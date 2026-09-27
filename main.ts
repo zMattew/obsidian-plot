@@ -1,6 +1,23 @@
 import { parse } from "mathjs";
 import { App, finishRenderMath, MarkdownPostProcessorContext, MarkdownRenderChild, Modal, Plugin, renderMath, TFile } from "obsidian";
-import type { MathPlotConfig } from "./types";
+import type { AxesVisibility, MathPlotConfig, PlotItem } from "./types";
+
+type PlotItemData = {
+  type?: PlotItem["type"];
+  fn?: string;
+  coords?: string;
+  origin?: string;
+  dir?: string;
+  color?: string;
+  opacity?: number;
+  label?: string;
+  visible?: boolean;
+  name?: string;
+  value?: number;
+  min?: number;
+  max?: number;
+  step?: number;
+};
 
 interface PlotRowElement {
   row: HTMLDivElement;
@@ -8,7 +25,7 @@ interface PlotRowElement {
   colorBadge: HTMLDivElement;
   colorBox: HTMLInputElement;
   bodyContainer: HTMLDivElement;
-  type: string;
+  type: PlotItem["type"];
   color: string;
   opacity: number;
   visible: boolean;
@@ -23,12 +40,68 @@ interface PlotRowElement {
   previewEl?: HTMLDivElement;
 }
 
+interface PlotUIState {
+  type: MathPlotConfig["type"];
+  renderStyle: NonNullable<MathPlotConfig["renderStyle"]>;
+  resolution: number;
+  showIntersections: boolean;
+  axisMode: NonNullable<MathPlotConfig["axisMode"]>;
+  showAxisNumbers: boolean;
+  axesEnabled: Required<AxesVisibility>;
+  viewOnly: boolean;
+  bounds: number[];
+  rows: PlotRowElement[];
+  rotX: number;
+  rotZ: number;
+  scale: number;
+  panX: number;
+  panY: number;
+  locked: boolean;
+}
+
+interface ProjectedPoint {
+  px: number;
+  py: number;
+  depth: number;
+}
+
+interface ActiveFunction {
+  fn: (x: number, y: number) => number | null;
+  col: string;
+  op: number;
+  label: string;
+  gridZ: Array<Array<number | null>>;
+}
+
+interface SurfacePolygon {
+  pts: [ProjectedPoint, ProjectedPoint, ProjectedPoint, ProjectedPoint];
+  color: string;
+  edgeColor: string;
+  depth: number;
+}
+
 const ALLOWED_MATH_FUNCTIONS = new Set([
   "abs", "acos", "asin", "atan", "ceil", "cos", "cosh", "exp", "floor", "log", "max", "min",
   "pow", "round", "sign", "sin", "sinh", "sqrt", "tan", "tanh"
 ]);
 const ALLOWED_MATH_OPERATORS = new Set(["+", "-", "*", "/", "%", "^"]);
 const RESERVED_VARIABLE_NAMES = new Set(["x", "y", "z", "e", "pi"]);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isUnknownArray(value: unknown): value is unknown[] {
+  return Array.isArray(value);
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function isFiniteNumberArray(value: unknown): value is number[] {
+  return isUnknownArray(value) && value.every(isFiniteNumber);
+}
 
 function isValidVariableName(name: string): boolean {
   const normalizedName = name.toLowerCase();
@@ -45,7 +118,7 @@ export default class MultiPlotterPlugin extends Plugin {
     this.blockRegistry = new WeakMap();
 
     this.addCommand({
-      id: "open-math-plot-modal",
+      id: "create-new-graph",
       name: "Create new graph (Modal UI)",
       editorCallback: (editor) => {
         new MathPlotModal(this.app, this, (markdown) => {
@@ -79,7 +152,8 @@ export default class MultiPlotterPlugin extends Plugin {
         try {
           config = this.parseConfig(source);
         } catch (e) {
-          el.createEl("pre", { text: "Math-Plot Configuration Error:\n" + e.message });
+          const message = e instanceof Error ? e.message : String(e);
+          el.createEl("pre", { text: "Math-Plot Configuration Error:\n" + message });
           return;
         }
       }
@@ -89,12 +163,15 @@ export default class MultiPlotterPlugin extends Plugin {
   }
 
   parseConfig(raw: string): MathPlotConfig {
-    let parsed: any;
+    let parsed: unknown;
+    let parseFailed = false;
     try {
-      parsed = JSON.parse(raw);
-    } catch (_) {}
+      parsed = JSON.parse(raw) as unknown;
+    } catch {
+      parseFailed = true;
+    }
 
-    if (parsed === undefined) {
+    if (parseFailed) {
       let sanitized = "";
       let inString = false;
       for (let i = 0; i < raw.length; i++) {
@@ -113,37 +190,42 @@ export default class MultiPlotterPlugin extends Plugin {
           sanitized += char;
         }
       }
-      parsed = JSON.parse(sanitized);
+      parsed = JSON.parse(sanitized) as unknown;
     }
 
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    if (!isRecord(parsed)) {
       throw new Error("Configuration must be a JSON object.");
     }
     if (parsed.items === undefined) parsed.items = [];
-    if (!Array.isArray(parsed.items)) throw new Error("'items' must be an array.");
+    const items = parsed.items;
+    if (!isUnknownArray(items)) throw new Error("'items' must be an array.");
     if (parsed.type !== undefined && parsed.type !== "2d" && parsed.type !== "3d") {
       throw new Error("'type' must be '2d' or '3d'.");
     }
-    if (parsed.renderStyle !== undefined && !["wireframe", "solid", "points"].includes(parsed.renderStyle)) {
+    if (parsed.renderStyle !== undefined && (typeof parsed.renderStyle !== "string" ||
+      !["wireframe", "solid", "points"].includes(parsed.renderStyle))) {
       throw new Error("'renderStyle' must be 'wireframe', 'solid' or 'points'.");
     }
-    if (parsed.axisMode !== undefined && !["ticks", "grid", "none"].includes(parsed.axisMode)) {
+    if (parsed.axisMode !== undefined && (typeof parsed.axisMode !== "string" ||
+      !["ticks", "grid", "none"].includes(parsed.axisMode))) {
       throw new Error("'axisMode' must be 'ticks', 'grid' or 'none'.");
     }
-    if (parsed.resolution !== undefined && (!Number.isFinite(parsed.resolution) || parsed.resolution < 1)) {
+    if (parsed.resolution !== undefined && (!isFiniteNumber(parsed.resolution) || parsed.resolution < 1)) {
       throw new Error("'resolution' must be a positive finite number.");
     }
-    if (parsed.bounds !== undefined && (!Array.isArray(parsed.bounds) || ![2, 4].includes(parsed.bounds.length) ||
-      !parsed.bounds.every(Number.isFinite) || parsed.bounds[0] >= parsed.bounds[1] ||
-      (parsed.bounds.length === 4 && parsed.bounds[2] >= parsed.bounds[3]))) {
-      throw new Error("'bounds' must contain two or four finite values in ascending order.");
+    if (parsed.bounds !== undefined) {
+      const bounds = parsed.bounds;
+      if (!isFiniteNumberArray(bounds) || ![2, 4].includes(bounds.length) || bounds[0] >= bounds[1] ||
+        (bounds.length === 4 && bounds[2] >= bounds[3])) {
+        throw new Error("'bounds' must contain two or four finite values in ascending order.");
+      }
     }
 
-    parsed.items.forEach((item: any, index: number) => {
+    items.forEach((item, index) => {
       const prefix = `Item ${index + 1}`;
-      if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error(`${prefix} must be an object.`);
+      if (!isRecord(item)) throw new Error(`${prefix} must be an object.`);
       if (item.type === "var") {
-        if (typeof item.name !== "string" || !isValidVariableName(item.name) || !Number.isFinite(item.value)) {
+        if (typeof item.name !== "string" || !isValidVariableName(item.name) || !isFiniteNumber(item.value)) {
           throw new Error(`${prefix} must have a valid non-reserved variable name and finite value.`);
         }
       } else if (item.type === "fn") {
@@ -159,7 +241,7 @@ export default class MultiPlotterPlugin extends Plugin {
       }
     });
 
-    return parsed as MathPlotConfig;
+    return parsed as unknown as MathPlotConfig;
   }
 
   attachLatexSuiteShortcuts(inputEl: HTMLInputElement, onUpdate: () => void) {
@@ -258,13 +340,13 @@ export default class MultiPlotterPlugin extends Plugin {
         } else {
           evaluate = null;
         }
-      } catch (_) {
+      } catch {
         evaluate = null;
       }
 
       this.compiledExpressions.set(cacheKey, evaluate);
       if (this.compiledExpressions.size > 256) {
-        const oldestKey = this.compiledExpressions.keys().next().value;
+        const oldestKey = this.compiledExpressions.keys().next().value as string | undefined;
         if (oldestKey !== undefined) this.compiledExpressions.delete(oldestKey);
       }
     }
@@ -274,7 +356,7 @@ export default class MultiPlotterPlugin extends Plugin {
       try {
         const value = evaluate({ ...vars, x, y });
         return typeof value === "number" && Number.isFinite(value) ? value : null;
-      } catch (_) {
+      } catch {
         return null;
       }
     };
@@ -307,7 +389,7 @@ export default class MultiPlotterPlugin extends Plugin {
     const addPtBtn = toolbar.createEl("button", { text: "+ Point" });
     const addVecBtn = toolbar.createEl("button", { text: "+ Vector" });
 
-    let insertBtn = null;
+    let insertBtn: HTMLButtonElement | null = null;
     if (onInsertCallback) {
       insertBtn = toolbar.createEl("button", { text: "Insert into note", cls: "mod-cta" });
     }
@@ -327,8 +409,8 @@ export default class MultiPlotterPlugin extends Plugin {
 
     dropdownMenu.addEventListener("click", (e) => e.stopPropagation());
 
-    const closeDropdownHandler = (e) => {
-      if (!wrapper.contains(e.target)) {
+    const closeDropdownHandler = (e: MouseEvent): void => {
+      if (!(e.target instanceof Node) || !wrapper.contains(e.target)) {
         dropdownMenu.classList.remove("is-open");
         menuBtn.setText("⚙ Plot options ▾");
       }
@@ -346,7 +428,7 @@ export default class MultiPlotterPlugin extends Plugin {
       panY: 20
     };
 
-    const state = {
+    const state: PlotUIState = {
       type: initialConfig.type || "3d",
       renderStyle: initialConfig.renderStyle || "wireframe",
       resolution: Number(initialConfig.resolution) || 50,
@@ -368,39 +450,35 @@ export default class MultiPlotterPlugin extends Plugin {
     const tracker = { skipNextRender: false };
     this.blockRegistry.set(rootEl, tracker);
 
-    const createOptionRow = (labelText, controlEl) => {
+    const createOptionRow = (labelText: string, controlEl: HTMLElement): HTMLDivElement => {
       const row = dropdownMenu.createDiv({ cls: "math-option-row" });
-      const lbl = row.createSpan({ text: labelText, cls: "math-option-label" });
+      row.createSpan({ text: labelText, cls: "math-option-label" });
       row.appendChild(controlEl);
       return row;
     };
 
-    const typeSelect = document.createElement("select");
+    const typeSelect = dropdownMenu.createEl("select");
     ["3d", "2d"].forEach(t => {
-      const opt = document.createElement("option");
+      const opt = typeSelect.createEl("option", { text: t.toUpperCase() });
       opt.value = t;
-      opt.text = t.toUpperCase();
       if (t === state.type) opt.selected = true;
-      typeSelect.appendChild(opt);
     });
     createOptionRow("Graph type:", typeSelect);
 
-    const styleSelect = document.createElement("select");
+    const styleSelect = dropdownMenu.createEl("select");
     const styleOptions = [
       { val: "wireframe", label: "Wireframe (Grid)" },
       { val: "solid", label: "Solid (Surface)" },
       { val: "points", label: "Point cloud" }
     ];
     styleOptions.forEach(s => {
-      const opt = document.createElement("option");
+      const opt = styleSelect.createEl("option", { text: s.label });
       opt.value = s.val;
-      opt.text = s.label;
       if (s.val === state.renderStyle) opt.selected = true;
-      styleSelect.appendChild(opt);
     });
     createOptionRow("Render style:", styleSelect);
 
-    const resSelect = document.createElement("select");
+    const resSelect = dropdownMenu.createEl("select");
     const resOptions = [
       { val: 24, label: "Low (24)" },
       { val: 40, label: "Medium (40)" },
@@ -409,41 +487,37 @@ export default class MultiPlotterPlugin extends Plugin {
       { val: 80, label: "Ultra (80)" }
     ];
     resOptions.forEach(r => {
-      const opt = document.createElement("option");
+      const opt = resSelect.createEl("option", { text: r.label });
       opt.value = String(r.val);
-      opt.text = r.label;
       if (r.val === state.resolution) opt.selected = true;
-      resSelect.appendChild(opt);
     });
     createOptionRow("Resolution:", resSelect);
 
-    const axisModeSelect = document.createElement("select");
+    const axisModeSelect = dropdownMenu.createEl("select");
     const axisModeOptions = [
       { val: "ticks", label: "Ticks (Reliefs)" },
       { val: "grid", label: "Full Grid" },
       { val: "none", label: "None" }
     ];
     axisModeOptions.forEach(m => {
-      const opt = document.createElement("option");
+      const opt = axisModeSelect.createEl("option", { text: m.label });
       opt.value = m.val;
-      opt.text = m.label;
       if (m.val === state.axisMode) opt.selected = true;
-      axisModeSelect.appendChild(opt);
     });
     createOptionRow("Axes style:", axisModeSelect);
 
     const axisNumRow = dropdownMenu.createDiv({ cls: "math-axis-row" });
-    const axisNumLabel = axisNumRow.createSpan({ text: "Show axis numbers:", cls: "math-option-label" });
+    axisNumRow.createSpan({ text: "Show axis numbers:", cls: "math-option-label" });
     const axisNumToggle = axisNumRow.createEl("input", { type: "checkbox" });
     axisNumToggle.checked = state.showAxisNumbers;
     axisNumToggle.classList.add("math-checkbox");
 
     const axesSelectRow = dropdownMenu.createDiv({ cls: "math-axis-row" });
-    const axesLabel = axesSelectRow.createSpan({ text: "Visible axes:", cls: "math-option-label" });
+    axesSelectRow.createSpan({ text: "Visible axes:", cls: "math-option-label" });
 
     const axesGroup = axesSelectRow.createDiv({ cls: "math-axis-group" });
 
-    const createAxisCheckbox = (name) => {
+    const createAxisCheckbox = (name: keyof Required<AxesVisibility>): HTMLDivElement => {
       const wrap = axesGroup.createDiv({ cls: "math-axis-option" });
       const cb = wrap.createEl("input", { type: "checkbox" });
       cb.checked = state.axesEnabled[name] !== false;
@@ -575,11 +649,11 @@ export default class MultiPlotterPlugin extends Plugin {
       };
     };
 
-    let saveTimer = null;
+    let saveTimer: number | null = null;
     const debouncedSave = () => {
       if (!ctx || !ctx.sourcePath) return;
-      clearTimeout(saveTimer);
-      saveTimer = setTimeout(async () => {
+      if (saveTimer !== null) window.clearTimeout(saveTimer);
+      saveTimer = window.setTimeout(async () => {
         try {
           if (lifecycleController.signal.aborted) return;
           const file = this.app.vault.getAbstractFileByPath(ctx.sourcePath);
@@ -666,14 +740,14 @@ export default class MultiPlotterPlugin extends Plugin {
       debouncedSave();
     });
 
-    let draggedRowEl = null;
+    let draggedRowEl: HTMLDivElement | null = null;
 
-    const attachDragEvents = (rowEl, dragHandle) => {
+    const attachDragEvents = (rowEl: HTMLDivElement, dragHandle: HTMLSpanElement): void => {
       dragHandle.draggable = true;
 
       dragHandle.addEventListener("dragstart", (e) => {
         draggedRowEl = rowEl;
-        e.dataTransfer.effectAllowed = "move";
+        if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
         rowEl.classList.add("is-dragging");
       });
 
@@ -685,7 +759,7 @@ export default class MultiPlotterPlugin extends Plugin {
 
       rowEl.addEventListener("dragover", (e) => {
         e.preventDefault();
-        e.dataTransfer.dropEffect = "move";
+        if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
         if (draggedRowEl && draggedRowEl !== rowEl) {
           rowEl.classList.add("is-drop-target");
         }
@@ -712,7 +786,7 @@ export default class MultiPlotterPlugin extends Plugin {
       });
     };
 
-    const updateMathPreview = (previewEl, text, prefix) => {
+    const updateMathPreview = (previewEl: HTMLDivElement, text: string, prefix: string): void => {
       previewEl.empty();
       const raw = text.trim();
       if (!raw) {
@@ -729,12 +803,16 @@ export default class MultiPlotterPlugin extends Plugin {
         const mathNode = renderMath(formula, false);
         previewEl.appendChild(mathNode);
         finishRenderMath();
-      } catch (_) {
+      } catch {
         previewEl.setText(formula);
       }
     };
 
-    const createRow = (itemData = null, rowType = "fn", startWithFocus = false) => {
+    const createRow = (
+      itemData: PlotItemData | null = null,
+      rowType: PlotItem["type"] = "fn",
+      startWithFocus = false
+    ): void => {
       const row = rowsContainer.createDiv({ cls: "math-row" });
 
       const dragHandle = row.createSpan({ text: "⠿", cls: "drag-handle math-row-drag-handle" });
@@ -766,7 +844,7 @@ export default class MultiPlotterPlugin extends Plugin {
       alphaSlider.min = "0";
       alphaSlider.max = "1";
       alphaSlider.step = "0.05";
-      alphaSlider.value = (itemData && itemData.opacity !== undefined) ? itemData.opacity : 1.0;
+      alphaSlider.value = String((itemData && itemData.opacity !== undefined) ? itemData.opacity : 1.0);
       alphaSlider.classList.add("math-opacity-slider");
 
       colorBadge.addEventListener("click", (e) => {
@@ -915,7 +993,7 @@ export default class MultiPlotterPlugin extends Plugin {
 
         slider.addEventListener("mousedown", (e) => e.stopPropagation());
 
-        const onVal = (val) => {
+        const onVal = (val: string): void => {
           itemRef.value = Number(val);
           slider.value = val;
           numInput.value = val;
@@ -943,7 +1021,7 @@ export default class MultiPlotterPlugin extends Plugin {
       itemRef.input = input;
       itemRef.previewEl = previewEl;
 
-      const setMode = (isEditing) => {
+      const setMode = (isEditing: boolean): void => {
         row.classList.toggle("is-editing", isEditing);
         if (isEditing) input.focus();
         else updateMathPreview(previewEl, input.value, prefix);
@@ -954,7 +1032,7 @@ export default class MultiPlotterPlugin extends Plugin {
 
       previewEl.addEventListener("click", () => setMode(true));
 
-      const testAndTransformSlider = () => {
+      const testAndTransformSlider = (): boolean => {
         if (transformedToSlider) return true;
         const txt = input.value.trim();
         const match = txt.match(/^([a-zA-Z][a-zA-Z0-9_]*)\s*=\s*(-?\d*\.?\d+)$/);
@@ -996,7 +1074,7 @@ export default class MultiPlotterPlugin extends Plugin {
     };
 
     if (initialConfig.items && initialConfig.items.length > 0) {
-      initialConfig.items.forEach(it => createRow(it, it.type || "fn", false));
+      initialConfig.items.forEach(it => createRow(it, it.type, false));
     } else {
       createRow({ type: "fn", fn: state.type === "3d" ? "\\sqrt{x^2 + y^2}" : "\\sin(x)" }, "fn", false);
     }
@@ -1080,9 +1158,9 @@ export default class MultiPlotterPlugin extends Plugin {
     });
 
     copyBtn.addEventListener("click", () => {
-      navigator.clipboard.writeText("```math-plot\n" + JSON.stringify(buildExportJSON(), null, 2) + "\n```\n");
+      void navigator.clipboard.writeText("```math-plot\n" + JSON.stringify(buildExportJSON(), null, 2) + "\n```\n");
       copyBtn.setText("Copied!");
-      setTimeout(() => copyBtn.setText("Copy Markdown"), 2000);
+      window.setTimeout(() => copyBtn.setText("Copy Markdown"), 2000);
     });
 
     if (insertBtn && onInsertCallback) {
@@ -1096,8 +1174,8 @@ export default class MultiPlotterPlugin extends Plugin {
     const cleanup = () => {
       lifecycleController.abort();
       if (drawFrame) window.cancelAnimationFrame(drawFrame);
-      if (saveTimer) clearTimeout(saveTimer);
-      clearTimeout(initialDrawTimer);
+      if (saveTimer !== null) window.clearTimeout(saveTimer);
+      window.clearTimeout(initialDrawTimer);
     };
     if (ctx) {
       const renderChild = new MarkdownRenderChild(rootEl);
@@ -1107,7 +1185,7 @@ export default class MultiPlotterPlugin extends Plugin {
     return cleanup;
   }
 
-  drawCanvas(canvas, state) {
+  drawCanvas(canvas: HTMLCanvasElement, state: PlotUIState): void {
     const rect = canvas.getBoundingClientRect();
     if (!rect || rect.width === 0 || rect.height === 0) return;
 
@@ -1126,15 +1204,15 @@ export default class MultiPlotterPlugin extends Plugin {
 
     ctx.clearRect(0, 0, w, h);
 
-    const labelsToDraw = [];
-    const overlaysToDraw = [];
+    const labelsToDraw: Array<{ text: string; px: number; py: number; color: string }> = [];
+    const overlaysToDraw: Array<() => void> = [];
 
-    const currentVars = {};
+    const currentVars: Record<string, number> = {};
     state.rows.forEach(r => {
       if (r.type === "var") currentVars[r.name] = r.value;
     });
 
-    const hexToRgba = (hex, alpha = 1.0) => {
+    const hexToRgba = (hex: string, alpha = 1.0): string => {
       let num = parseInt((hex || "#4caf50").replace("#", ""), 16);
       if (isNaN(num)) return `rgba(76, 175, 80, ${alpha})`;
       let r = (num >> 16) & 255;
@@ -1143,7 +1221,7 @@ export default class MultiPlotterPlugin extends Plugin {
       return `rgba(${r}, ${g}, ${b}, ${alpha})`;
     };
 
-    const shadeRgba = (hex, percent, alpha = 1.0) => {
+    const shadeRgba = (hex: string, percent: number, alpha = 1.0): string => {
       let num = parseInt((hex || "#4caf50").replace("#", ""), 16);
       if (isNaN(num)) return `rgba(76, 175, 80, ${alpha})`;
       let r = Math.max(0, Math.min(255, ((num >> 16) & 255) + percent));
@@ -1152,7 +1230,7 @@ export default class MultiPlotterPlugin extends Plugin {
       return `rgba(${r}, ${g}, ${b}, ${alpha})`;
     };
 
-    const queueLabel = (text, px, py, color = "#ffffff") => {
+    const queueLabel = (text: string, px: number, py: number, color = "#ffffff"): void => {
       if (!text) return;
       labelsToDraw.push({ text, px, py, color });
     };
@@ -1342,7 +1420,7 @@ export default class MultiPlotterPlugin extends Plugin {
       const yMin = bounds[2];
       const yMax = bounds[3];
 
-      const project = (x, y, z) => {
+      const project = (x: number, y: number, z: number): ProjectedPoint => {
         const radX = state.rotX;
         const radZ = state.rotZ;
 
@@ -1388,7 +1466,14 @@ export default class MultiPlotterPlugin extends Plugin {
         }
       }
 
-      const drawAxis3D = (axisName, endX, endY, endZ, label, col) => {
+      const drawAxis3D = (
+        axisName: keyof Required<AxesVisibility>,
+        endX: number,
+        endY: number,
+        endZ: number,
+        label: string,
+        col: string
+      ): void => {
         if (!state.axesEnabled[axisName]) return;
 
         const p0 = project(0, 0, 0);
@@ -1415,7 +1500,11 @@ export default class MultiPlotterPlugin extends Plugin {
           const tickStep = Math.max(1, Math.round(maxVal / 5));
 
           for (let v = tickStep; v < maxVal; v += tickStep) {
-            let px0, py0, px1, py1, labelPos;
+            let px0: number;
+            let py0: number;
+            let px1: number;
+            let py1: number;
+            let labelPos: ProjectedPoint;
 
             if (axisName === "x") {
               const ptA = project(v, 0, 0);
@@ -1457,7 +1546,7 @@ export default class MultiPlotterPlugin extends Plugin {
       const stepX = (xMax - xMin) / steps;
       const stepY = (yMax - yMin) / steps;
 
-      const activeFns = [];
+      const activeFns: ActiveFunction[] = [];
 
       state.rows.forEach(r => {
         if (!r.input || r.visible === false) return;
@@ -1534,9 +1623,9 @@ export default class MultiPlotterPlugin extends Plugin {
         const fn = this.latexToJS(val, currentVars);
         const op = r.opacity !== undefined ? r.opacity : 1.0;
 
-        const gridZ = [];
+        const gridZ: Array<Array<number | null>> = [];
         for (let j = 0; j <= steps; j++) {
-          const rowZ = [];
+          const rowZ: Array<number | null> = [];
           const my = yMin + j * stepY;
           for (let i = 0; i <= steps; i++) {
             const mx = xMin + i * stepX;
@@ -1550,7 +1639,7 @@ export default class MultiPlotterPlugin extends Plugin {
       });
 
       if (state.renderStyle === "solid") {
-        const polygons = [];
+        const polygons: SurfacePolygon[] = [];
 
         activeFns.forEach(({ col, op, gridZ }) => {
           for (let j = 0; j < steps; j++) {
@@ -1682,9 +1771,8 @@ export default class MultiPlotterPlugin extends Plugin {
             const gA = activeFns[a].gridZ;
             const gB = activeFns[b].gridZ;
 
-            const diffGrid = [];
+            const diffGrid: Array<number | null> = [];
             for (let j = 0; j <= steps; j++) {
-              const rowDiff = [];
               for (let i = 0; i <= steps; i++) {
                 const za = gA[j][i];
                 const zb = gB[j][i];
@@ -1708,7 +1796,7 @@ export default class MultiPlotterPlugin extends Plugin {
 
                 if (d00 === null || d10 === null || d11 === null || d01 === null) continue;
 
-                const edges = [];
+                const edges: ProjectedPoint[] = [];
 
                 if ((d00 >= 0 && d10 < 0) || (d00 < 0 && d10 >= 0)) {
                   const t = d00 / (d00 - d10);
