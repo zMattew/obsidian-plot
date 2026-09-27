@@ -1,0 +1,1 @@
+Obsidian plugin for creating math 2D/3D graph
