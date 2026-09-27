@@ -7,7 +7,8 @@ const watch = process.argv.includes("--watch");
 await mkdir(outputDirectory, { recursive: true });
 await Promise.all([
   copyFile("manifest.json", `${outputDirectory}/manifest.json`),
-  copyFile("prompt.md", `${outputDirectory}/prompt.md`)
+  copyFile("prompt.md", `${outputDirectory}/prompt.md`),
+  copyFile("styles.css", `${outputDirectory}/styles.css`)
 ]);
 
 const buildOptions = {

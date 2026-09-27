@@ -13,7 +13,7 @@ Plot is an Obsidian plugin for creating interactive 2D graphs and 3D surfaces di
 
 ## Install
 
-Download `main.js` and `manifest.json` from a release and place them in your vault at:
+Download `main.js`, `manifest.json`, and `styles.css` from a release and place them in your vault at:
 
 ```text
 <Vault>/.obsidian/plugins/plot/

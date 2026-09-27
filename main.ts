@@ -300,21 +300,8 @@ export default class MultiPlotterPlugin extends Plugin {
     rootEl.empty();
 
     const wrapper = rootEl.createDiv({ cls: "math-plot-container" });
-    wrapper.style.display = "flex";
-    wrapper.style.flexDirection = "column";
-    wrapper.style.gap = "10px";
-    wrapper.style.padding = "10px";
-    wrapper.style.border = "1px solid var(--background-modifier-border)";
-    wrapper.style.borderRadius = "8px";
-    wrapper.style.background = "var(--background-secondary)";
-    wrapper.style.position = "relative";
 
     const toolbar = wrapper.createDiv({ cls: "math-toolbar" });
-    toolbar.style.display = "flex";
-    toolbar.style.gap = "8px";
-    toolbar.style.alignItems = "center";
-    toolbar.style.position = "relative";
-    toolbar.style.width = "100%";
 
     const addBtn = toolbar.createEl("button", { text: "+ Equation" });
     const addPtBtn = toolbar.createEl("button", { text: "+ Point" });
@@ -324,39 +311,25 @@ export default class MultiPlotterPlugin extends Plugin {
     if (onInsertCallback) {
       insertBtn = toolbar.createEl("button", { text: "Insert into note", cls: "mod-cta" });
     }
-    const viewModeBtn = toolbar.createEl("button", { text: initialConfig.viewOnly ? "Show UI" : "Hide UI" });
+    const viewModeBtn = toolbar.createEl("button", { text: initialConfig.viewOnly ? "Show UI" : "Hide UI", cls: "math-view-mode-button" });
 
     const menuBtn = toolbar.createEl("button", { text: "⚙ Plot options ▾" });
-    menuBtn.style.marginLeft = "auto";
-    menuBtn.style.fontWeight = "bold";
+    menuBtn.classList.add("math-plot-menu-button");
 
     const dropdownMenu = wrapper.createDiv({ cls: "math-dropdown-panel" });
-    dropdownMenu.style.display = "none";
-    dropdownMenu.style.flexDirection = "column";
-    dropdownMenu.style.gap = "10px";
-    dropdownMenu.style.padding = "12px";
-    dropdownMenu.style.background = "var(--background-primary)";
-    dropdownMenu.style.border = "1px solid var(--background-modifier-border)";
-    dropdownMenu.style.borderRadius = "6px";
-    dropdownMenu.style.boxShadow = "0 4px 14px rgba(0,0,0,0.25)";
-    dropdownMenu.style.position = "absolute";
-    dropdownMenu.style.top = "46px";
-    dropdownMenu.style.right = "10px";
-    dropdownMenu.style.width = "320px";
-    dropdownMenu.style.zIndex = "100";
 
     menuBtn.addEventListener("click", (e) => {
       e.stopPropagation();
-      const isVisible = dropdownMenu.style.display === "flex";
-      dropdownMenu.style.display = isVisible ? "none" : "flex";
-      menuBtn.setText(isVisible ? "⚙ Plot options ▾" : "⚙ Plot options ▴");
+      const wasVisible = dropdownMenu.classList.contains("is-open");
+      dropdownMenu.classList.toggle("is-open", !wasVisible);
+      menuBtn.setText(wasVisible ? "⚙ Plot options ▾" : "⚙ Plot options ▴");
     });
 
     dropdownMenu.addEventListener("click", (e) => e.stopPropagation());
 
     const closeDropdownHandler = (e) => {
       if (!wrapper.contains(e.target)) {
-        dropdownMenu.style.display = "none";
+        dropdownMenu.classList.remove("is-open");
         menuBtn.setText("⚙ Plot options ▾");
       }
     };
@@ -396,13 +369,8 @@ export default class MultiPlotterPlugin extends Plugin {
     this.blockRegistry.set(rootEl, tracker);
 
     const createOptionRow = (labelText, controlEl) => {
-      const row = dropdownMenu.createDiv();
-      row.style.display = "flex";
-      row.style.justifyContent = "space-between";
-      row.style.alignItems = "center";
-      const lbl = row.createSpan({ text: labelText });
-      lbl.style.fontSize = "13px";
-      lbl.style.fontWeight = "500";
+      const row = dropdownMenu.createDiv({ cls: "math-option-row" });
+      const lbl = row.createSpan({ text: labelText, cls: "math-option-label" });
       row.appendChild(controlEl);
       return row;
     };
@@ -464,39 +432,23 @@ export default class MultiPlotterPlugin extends Plugin {
     });
     createOptionRow("Axes style:", axisModeSelect);
 
-    const axisNumRow = dropdownMenu.createDiv();
-    axisNumRow.style.display = "flex";
-    axisNumRow.style.justifyContent = "space-between";
-    axisNumRow.style.alignItems = "center";
-    const axisNumLabel = axisNumRow.createSpan({ text: "Show axis numbers:" });
-    axisNumLabel.style.fontSize = "13px";
-    axisNumLabel.style.fontWeight = "500";
+    const axisNumRow = dropdownMenu.createDiv({ cls: "math-axis-row" });
+    const axisNumLabel = axisNumRow.createSpan({ text: "Show axis numbers:", cls: "math-option-label" });
     const axisNumToggle = axisNumRow.createEl("input", { type: "checkbox" });
     axisNumToggle.checked = state.showAxisNumbers;
-    axisNumToggle.style.cursor = "pointer";
+    axisNumToggle.classList.add("math-checkbox");
 
-    const axesSelectRow = dropdownMenu.createDiv();
-    axesSelectRow.style.display = "flex";
-    axesSelectRow.style.justifyContent = "space-between";
-    axesSelectRow.style.alignItems = "center";
-    const axesLabel = axesSelectRow.createSpan({ text: "Visible axes:" });
-    axesLabel.style.fontSize = "13px";
-    axesLabel.style.fontWeight = "500";
+    const axesSelectRow = dropdownMenu.createDiv({ cls: "math-axis-row" });
+    const axesLabel = axesSelectRow.createSpan({ text: "Visible axes:", cls: "math-option-label" });
 
-    const axesGroup = axesSelectRow.createDiv();
-    axesGroup.style.display = "flex";
-    axesGroup.style.gap = "8px";
-    axesGroup.style.alignItems = "center";
+    const axesGroup = axesSelectRow.createDiv({ cls: "math-axis-group" });
 
     const createAxisCheckbox = (name) => {
-      const wrap = axesGroup.createDiv();
-      wrap.style.display = "flex";
-      wrap.style.alignItems = "center";
-      wrap.style.gap = "2px";
+      const wrap = axesGroup.createDiv({ cls: "math-axis-option" });
       const cb = wrap.createEl("input", { type: "checkbox" });
       cb.checked = state.axesEnabled[name] !== false;
-      cb.style.cursor = "pointer";
-      wrap.createSpan({ text: name.toUpperCase() }).style.fontSize = "12px";
+      cb.classList.add("math-checkbox");
+      wrap.createSpan({ text: name.toUpperCase(), cls: "math-axis-name" });
 
       cb.addEventListener("change", (e) => {
         state.axesEnabled[name] = (e.target as HTMLInputElement).checked;
@@ -509,78 +461,38 @@ export default class MultiPlotterPlugin extends Plugin {
     createAxisCheckbox("x");
     createAxisCheckbox("y");
     const zWrap = createAxisCheckbox("z");
-    zWrap.style.display = state.type === "3d" ? "flex" : "none";
+    zWrap.classList.toggle("math-hidden", state.type !== "3d");
 
-    const isectRow = dropdownMenu.createDiv();
-    isectRow.style.display = "flex";
-    isectRow.style.justifyContent = "space-between";
-    isectRow.style.alignItems = "center";
-    const isectLabel = isectRow.createSpan({ text: "Highlight intersections:" });
-    isectLabel.style.fontSize = "13px";
-    isectLabel.style.fontWeight = "500";
+    const isectRow = dropdownMenu.createDiv({ cls: "math-intersection-row" });
+    isectRow.createSpan({ text: "Highlight intersections:", cls: "math-option-label" });
     const isectToggle = isectRow.createEl("input", { type: "checkbox" });
     isectToggle.checked = state.showIntersections;
-    isectToggle.style.cursor = "pointer";
+    isectToggle.classList.add("math-checkbox");
 
-    const copyRow = dropdownMenu.createDiv();
-    copyRow.style.display = "flex";
-    copyRow.style.justifyContent = "flex-end";
-    copyRow.style.marginTop = "6px";
-    copyRow.style.paddingTop = "8px";
-    copyRow.style.borderTop = "1px solid var(--background-modifier-border)";
+    const copyRow = dropdownMenu.createDiv({ cls: "math-copy-row" });
 
-    const copyBtn = copyRow.createEl("button", { text: "Copy Markdown" });
-    copyBtn.style.width = "100%";
+    const copyBtn = copyRow.createEl("button", { text: "Copy Markdown", cls: "math-copy-button" });
 
     const rowsContainer = wrapper.createDiv({ cls: "math-rows-container" });
-    rowsContainer.style.display = "flex";
-    rowsContainer.style.flexDirection = "column";
-    rowsContainer.style.gap = "6px";
 
     const canvasContainer = wrapper.createDiv({ cls: "math-canvas-container" });
-    canvasContainer.style.width = "100%";
-    canvasContainer.style.height = "490px";
-    canvasContainer.style.position = "relative";
-    canvasContainer.style.overflow = "hidden";
-    canvasContainer.style.borderRadius = "6px";
-    canvasContainer.style.background = "var(--background-primary)";
 
-    const overlayControls = canvasContainer.createDiv();
-    overlayControls.style.position = "absolute";
-    overlayControls.style.top = "10px";
-    overlayControls.style.right = "10px";
-    overlayControls.style.display = "flex";
-    overlayControls.style.gap = "6px";
-    overlayControls.style.zIndex = "20";
+    const overlayControls = canvasContainer.createDiv({ cls: "math-overlay-controls" });
 
-    const lockBtn = overlayControls.createEl("button", { text: "🔓" });
+    const lockBtn = overlayControls.createEl("button", { text: "🔓", cls: "math-overlay-button" });
     lockBtn.title = "Lock / Unlock view interaction";
-    lockBtn.style.padding = "4px 8px";
-    lockBtn.style.background = "rgba(20, 20, 20, 0.65)";
-    lockBtn.style.border = "1px solid var(--background-modifier-border)";
-    lockBtn.style.borderRadius = "4px";
-    lockBtn.style.cursor = "pointer";
 
-    const resetViewBtn = overlayControls.createEl("button", { text: "↺" });
+    const resetViewBtn = overlayControls.createEl("button", { text: "↺", cls: "math-overlay-button" });
     resetViewBtn.title = "Reset View to standard";
-    resetViewBtn.style.padding = "4px 8px";
-    resetViewBtn.style.background = "rgba(20, 20, 20, 0.65)";
-    resetViewBtn.style.border = "1px solid var(--background-modifier-border)";
-    resetViewBtn.style.borderRadius = "4px";
-    resetViewBtn.style.cursor = "pointer";
 
-    const canvas = canvasContainer.createEl("canvas");
-    canvas.style.width = "100%";
-    canvas.style.height = "100%";
-    canvas.style.display = "block";
-    canvas.style.cursor = "grab";
+    const canvas = canvasContainer.createEl("canvas", { cls: "math-canvas" });
 
     lockBtn.addEventListener("click", (e) => {
       e.stopPropagation();
       e.preventDefault();
       state.locked = !state.locked;
       lockBtn.setText(state.locked ? "🔒" : "🔓");
-      canvas.style.cursor = state.locked ? "not-allowed" : "grab";
+      canvas.classList.toggle("is-locked", state.locked);
     });
 
     resetViewBtn.addEventListener("click", (e) => {
@@ -697,21 +609,13 @@ export default class MultiPlotterPlugin extends Plugin {
     };
 
     const updateViewModeUI = () => {
+      wrapper.classList.toggle("is-view-only", state.viewOnly);
       if (state.viewOnly) {
-        rowsContainer.style.display = "none";
-        addBtn.style.display = "none";
-        addPtBtn.style.display = "none";
-        addVecBtn.style.display = "none";
-        menuBtn.style.display = "none";
-        dropdownMenu.style.display = "none";
+        dropdownMenu.classList.remove("is-open");
+        menuBtn.setText("⚙ Plot options ▾");
         viewModeBtn.setText("Show UI");
         viewModeBtn.classList.add("mod-cta");
       } else {
-        rowsContainer.style.display = "flex";
-        addBtn.style.display = "inline-block";
-        addPtBtn.style.display = "inline-block";
-        addVecBtn.style.display = "inline-block";
-        menuBtn.style.display = "inline-block";
         viewModeBtn.setText("Hide UI");
         viewModeBtn.classList.remove("mod-cta");
       }
@@ -727,7 +631,7 @@ export default class MultiPlotterPlugin extends Plugin {
     typeSelect.addEventListener("change", (e) => {
       state.type = (e.target as HTMLSelectElement).value as MathPlotConfig["type"];
       state.bounds = state.type === "2d" ? [-8, 8] : [-4, 4, -4, 4];
-      zWrap.style.display = state.type === "3d" ? "flex" : "none";
+      zWrap.classList.toggle("math-hidden", state.type !== "3d");
       this.drawCanvas(canvas, state);
       debouncedSave();
     });
@@ -770,30 +674,30 @@ export default class MultiPlotterPlugin extends Plugin {
       dragHandle.addEventListener("dragstart", (e) => {
         draggedRowEl = rowEl;
         e.dataTransfer.effectAllowed = "move";
-        rowEl.style.opacity = "0.4";
+        rowEl.classList.add("is-dragging");
       });
 
       dragHandle.addEventListener("dragend", () => {
         draggedRowEl = null;
-        rowEl.style.opacity = "1";
-        rowsContainer.querySelectorAll<HTMLElement>(".math-row").forEach(r => r.style.borderTop = "");
+        rowEl.classList.remove("is-dragging");
+        rowsContainer.querySelectorAll<HTMLElement>(".math-row").forEach(r => r.classList.remove("is-drop-target"));
       });
 
       rowEl.addEventListener("dragover", (e) => {
         e.preventDefault();
         e.dataTransfer.dropEffect = "move";
         if (draggedRowEl && draggedRowEl !== rowEl) {
-          rowEl.style.borderTop = "2px solid var(--interactive-accent)";
+          rowEl.classList.add("is-drop-target");
         }
       });
 
       rowEl.addEventListener("dragleave", () => {
-        rowEl.style.borderTop = "";
+        rowEl.classList.remove("is-drop-target");
       });
 
       rowEl.addEventListener("drop", (e) => {
         e.preventDefault();
-        rowEl.style.borderTop = "";
+        rowEl.classList.remove("is-drop-target");
         if (draggedRowEl && draggedRowEl !== rowEl) {
           const fromIndex = Array.from(rowsContainer.children).indexOf(draggedRowEl);
           const toIndex = Array.from(rowsContainer.children).indexOf(rowEl);
@@ -832,79 +736,29 @@ export default class MultiPlotterPlugin extends Plugin {
 
     const createRow = (itemData = null, rowType = "fn", startWithFocus = false) => {
       const row = rowsContainer.createDiv({ cls: "math-row" });
-      row.style.display = "flex";
-      row.style.gap = "6px";
-      row.style.alignItems = "center";
-      row.style.padding = "4px 8px";
-      row.style.background = "var(--background-primary)";
-      row.style.border = "1px solid var(--background-modifier-border)";
-      row.style.borderRadius = "6px";
-      row.style.boxSizing = "border-box";
-      row.style.width = "100%";
-      row.style.overflow = "hidden";
 
-      const dragHandle = row.createSpan({ text: "⠿", cls: "drag-handle" });
-      dragHandle.style.cursor = "grab";
-      dragHandle.style.color = "var(--text-muted)";
-      dragHandle.style.userSelect = "none";
-      dragHandle.style.flexShrink = "0";
-      dragHandle.style.padding = "0 2px";
+      const dragHandle = row.createSpan({ text: "⠿", cls: "drag-handle math-row-drag-handle" });
 
-      const visWrap = row.createDiv();
-      visWrap.style.display = "flex";
-      visWrap.style.alignItems = "center";
-      visWrap.style.flexShrink = "0";
+      const visWrap = row.createDiv({ cls: "math-row-visibility" });
       const visCheck = visWrap.createEl("input", { type: "checkbox" });
       visCheck.checked = (itemData && itemData.visible !== undefined) ? Boolean(itemData.visible) : true;
-      visCheck.style.cursor = "pointer";
+      visCheck.classList.add("math-checkbox");
       visCheck.title = "Toggle visibility";
 
-      const colorPickerWrapper = row.createDiv();
-      colorPickerWrapper.style.position = "relative";
-      colorPickerWrapper.style.display = "flex";
-      colorPickerWrapper.style.alignItems = "center";
-      colorPickerWrapper.style.flexShrink = "0";
+      const colorPickerWrapper = row.createDiv({ cls: "math-color-picker-wrapper" });
 
-      const colorBadge = colorPickerWrapper.createDiv();
-      colorBadge.style.width = "24px";
-      colorBadge.style.height = "24px";
-      colorBadge.style.borderRadius = "4px";
-      colorBadge.style.border = "1px solid var(--background-modifier-border)";
-      colorBadge.style.cursor = "pointer";
+      const colorBadge = colorPickerWrapper.createDiv({ cls: "math-color-badge" });
 
-      const colorPopover = colorPickerWrapper.createDiv();
-      colorPopover.style.display = "none";
-      colorPopover.style.position = "absolute";
-      colorPopover.style.top = "30px";
-      colorPopover.style.left = "0";
-      colorPopover.style.background = "var(--background-primary)";
-      colorPopover.style.border = "1px solid var(--background-modifier-border)";
-      colorPopover.style.padding = "8px 10px";
-      colorPopover.style.borderRadius = "6px";
-      colorPopover.style.boxShadow = "0 4px 14px rgba(0,0,0,0.25)";
-      colorPopover.style.zIndex = "110";
-      colorPopover.style.flexDirection = "column";
-      colorPopover.style.gap = "6px";
-      colorPopover.style.width = "140px";
+      const colorPopover = colorPickerWrapper.createDiv({ cls: "math-color-popover" });
 
-      const hexRow = colorPopover.createDiv();
-      hexRow.style.display = "flex";
-      hexRow.style.alignItems = "center";
-      hexRow.style.justifyContent = "space-between";
-      hexRow.createSpan({ text: "Color:" }).style.fontSize = "11px";
+      const hexRow = colorPopover.createDiv({ cls: "math-color-popover-row" });
+      hexRow.createSpan({ text: "Color:", cls: "math-color-label" });
 
       const colorBox = hexRow.createEl("input", { type: "color" });
       colorBox.value = (itemData && itemData.color) || palette[state.rows.length % palette.length];
-      colorBox.style.width = "40px";
-      colorBox.style.height = "24px";
-      colorBox.style.border = "none";
-      colorBox.style.cursor = "pointer";
+      colorBox.classList.add("math-color-box");
 
-      const alphaHeader = colorPopover.createDiv();
-      alphaHeader.style.display = "flex";
-      alphaHeader.style.alignItems = "center";
-      alphaHeader.style.justifyContent = "space-between";
-      alphaHeader.style.fontSize = "11px";
+      const alphaHeader = colorPopover.createDiv({ cls: "math-opacity-header" });
       alphaHeader.createSpan({ text: "Opacity:" });
       const alphaValueSpan = alphaHeader.createSpan();
 
@@ -913,34 +767,21 @@ export default class MultiPlotterPlugin extends Plugin {
       alphaSlider.max = "1";
       alphaSlider.step = "0.05";
       alphaSlider.value = (itemData && itemData.opacity !== undefined) ? itemData.opacity : 1.0;
-      alphaSlider.style.width = "100%";
-      alphaSlider.style.cursor = "pointer";
+      alphaSlider.classList.add("math-opacity-slider");
 
       colorBadge.addEventListener("click", (e) => {
         e.stopPropagation();
-        colorPopover.style.display = colorPopover.style.display === "none" ? "flex" : "none";
+        colorPopover.classList.toggle("is-open");
       });
       colorPopover.addEventListener("click", (e) => e.stopPropagation());
-      document.addEventListener("click", () => colorPopover.style.display = "none", { signal: lifecycleController.signal });
+      document.addEventListener("click", () => colorPopover.classList.remove("is-open"), { signal: lifecycleController.signal });
 
-      const bodyContainer = row.createDiv();
-      bodyContainer.style.flex = "1";
-      bodyContainer.style.minWidth = "0";
-      bodyContainer.style.display = "flex";
-      bodyContainer.style.gap = "6px";
-      bodyContainer.style.alignItems = "center";
+      const bodyContainer = row.createDiv({ cls: "math-row-body" });
 
-      const labelInput = row.createEl("input", { type: "text", placeholder: "Label" });
+      const labelInput = row.createEl("input", { type: "text", placeholder: "Label", cls: "math-row-label" });
       labelInput.value = (itemData && itemData.label) || "";
-      labelInput.style.width = "85px";
-      labelInput.style.minWidth = "60px";
-      labelInput.style.flexShrink = "0";
-      labelInput.style.fontSize = "12px";
-      labelInput.style.padding = "2px 6px";
 
-      const delBtn = row.createEl("button", { text: "✕" });
-      delBtn.style.padding = "4px 8px";
-      delBtn.style.flexShrink = "0";
+      const delBtn = row.createEl("button", { text: "✕", cls: "math-row-delete" });
 
       const itemRef: PlotRowElement = {
         row,
@@ -967,7 +808,7 @@ export default class MultiPlotterPlugin extends Plugin {
 
       visCheck.addEventListener("change", () => {
         itemRef.visible = visCheck.checked;
-        row.style.opacity = itemRef.visible ? "1" : "0.5";
+        row.classList.toggle("is-invisible", !itemRef.visible);
         this.drawCanvas(canvas, state);
         debouncedSave();
       });
@@ -1001,20 +842,14 @@ export default class MultiPlotterPlugin extends Plugin {
       });
 
       if (itemRef.type === "point") {
-        const badge = bodyContainer.createSpan({ text: "Pt:" });
-        badge.style.fontWeight = "bold";
-        badge.style.fontSize = "12px";
-        badge.style.flexShrink = "0";
+        bodyContainer.createSpan({ text: "Pt:", cls: "math-item-type-badge" });
 
         const ptInput = bodyContainer.createEl("input", {
           type: "text",
-          placeholder: "x, y, z"
+          placeholder: "x, y, z",
+          cls: "math-coordinate-input"
         });
         ptInput.value = (itemData && itemData.coords) || "1, 1, 2";
-        ptInput.style.flex = "1";
-        ptInput.style.minWidth = "0";
-        ptInput.style.width = "100%";
-        ptInput.style.fontFamily = "var(--font-monospace)";
         itemRef.input = ptInput;
 
         ptInput.addEventListener("input", () => {
@@ -1025,29 +860,22 @@ export default class MultiPlotterPlugin extends Plugin {
       }
 
       if (itemRef.type === "vector") {
-        const badge = bodyContainer.createSpan({ text: "Vec:" });
-        badge.style.fontWeight = "bold";
-        badge.style.fontSize = "12px";
-        badge.style.flexShrink = "0";
+        bodyContainer.createSpan({ text: "Vec:", cls: "math-item-type-badge" });
 
         const originInput = bodyContainer.createEl("input", {
           type: "text",
-          placeholder: "Orig x,y,z"
+          placeholder: "Orig x,y,z",
+          cls: "math-vector-input"
         });
         originInput.value = (itemData && itemData.origin) || "1, 1, 2";
-        originInput.style.flex = "1";
-        originInput.style.minWidth = "0";
-        originInput.style.fontFamily = "var(--font-monospace)";
         itemRef.input = originInput;
 
         const dirInput = bodyContainer.createEl("input", {
           type: "text",
-          placeholder: "Dir dx,dy,dz"
+          placeholder: "Dir dx,dy,dz",
+          cls: "math-vector-input"
         });
         dirInput.value = (itemData && itemData.dir) || "1, 0, -0.7";
-        dirInput.style.flex = "1";
-        dirInput.style.minWidth = "0";
-        dirInput.style.fontFamily = "var(--font-monospace)";
         itemRef.dirInput = dirInput;
 
         originInput.addEventListener("input", () => {
@@ -1062,13 +890,7 @@ export default class MultiPlotterPlugin extends Plugin {
       }
 
       if (itemRef.type === "var") {
-        colorPickerWrapper.style.display = "none";
-        visWrap.style.display = "none";
-        labelInput.style.display = "none";
-
-        bodyContainer.style.display = "flex";
-        bodyContainer.style.alignItems = "center";
-        bodyContainer.style.gap = "8px";
+        row.classList.add("math-variable-row");
 
         const name = (itemData && itemData.name) || "a";
         itemRef.name = name;
@@ -1077,25 +899,19 @@ export default class MultiPlotterPlugin extends Plugin {
         itemRef.max = Number((itemData && itemData.max) !== undefined ? itemData.max : 5);
         itemRef.step = Number((itemData && itemData.step) !== undefined ? itemData.step : 0.1);
 
-        const badge = bodyContainer.createSpan({ text: `${name} = ` });
-        badge.style.fontFamily = "var(--font-monospace)";
-        badge.style.fontWeight = "bold";
-        badge.style.flexShrink = "0";
+        bodyContainer.createSpan({ text: `${name} = `, cls: "math-variable-badge" });
 
         const numInput = bodyContainer.createEl("input", { type: "number" });
         numInput.value = String(itemRef.value);
         numInput.step = String(itemRef.step);
-        numInput.style.width = "65px";
-        numInput.style.flexShrink = "0";
+        numInput.classList.add("math-variable-number");
 
         const slider = bodyContainer.createEl("input", { type: "range" });
         slider.min = String(itemRef.min);
         slider.max = String(itemRef.max);
         slider.step = String(itemRef.step);
         slider.value = String(itemRef.value);
-        slider.style.flex = "1";
-        slider.style.minWidth = "0";
-        slider.style.cursor = "pointer";
+        slider.classList.add("math-variable-slider");
 
         slider.addEventListener("mousedown", (e) => e.stopPropagation());
 
@@ -1116,37 +932,21 @@ export default class MultiPlotterPlugin extends Plugin {
 
       const input = bodyContainer.createEl("input", {
         type: "text",
-        placeholder: state.type === "3d" ? "\\sqrt{x^2+y^2} or a = 2" : "\\sin(x) or a = 2"
+        placeholder: state.type === "3d" ? "\\sqrt{x^2+y^2} or a = 2" : "\\sin(x) or a = 2",
+        cls: "math-equation-input"
       });
       input.value = (itemData && itemData.fn) || "";
-      input.style.flex = "1";
-      input.style.minWidth = "0";
-      input.style.width = "100%";
-      input.style.fontFamily = "var(--font-monospace)";
 
-      const previewEl = bodyContainer.createDiv();
-      previewEl.style.flex = "1";
-      previewEl.style.minWidth = "0";
-      previewEl.style.minHeight = "32px";
-      previewEl.style.display = "flex";
-      previewEl.style.alignItems = "center";
-      previewEl.style.padding = "2px 6px";
-      previewEl.style.cursor = "text";
-      previewEl.style.overflow = "hidden";
+      row.classList.add("math-equation-row");
+      const previewEl = bodyContainer.createDiv({ cls: "math-equation-preview" });
 
       itemRef.input = input;
       itemRef.previewEl = previewEl;
 
       const setMode = (isEditing) => {
-        if (isEditing) {
-          previewEl.style.display = "none";
-          input.style.display = "block";
-          input.focus();
-        } else {
-          input.style.display = "none";
-          previewEl.style.display = "flex";
-          updateMathPreview(previewEl, input.value, prefix);
-        }
+        row.classList.toggle("is-editing", isEditing);
+        if (isEditing) input.focus();
+        else updateMathPreview(previewEl, input.value, prefix);
       };
 
       if (startWithFocus) setMode(true);
@@ -1238,7 +1038,8 @@ export default class MultiPlotterPlugin extends Plugin {
       isPanning = Boolean(e.shiftKey || e.button === 1);
       lastX = e.clientX;
       lastY = e.clientY;
-      canvas.style.cursor = isPanning ? "move" : "grabbing";
+      canvas.classList.toggle("is-panning", isPanning);
+      canvas.classList.add("is-dragging");
     });
 
     window.addEventListener("mousemove", (e) => {
@@ -1267,7 +1068,7 @@ export default class MultiPlotterPlugin extends Plugin {
       if (isDragging) {
         isDragging = false;
         isPanning = false;
-        canvas.style.cursor = state.locked ? "not-allowed" : "grab";
+        canvas.classList.remove("is-panning", "is-dragging");
       }
     }, { signal: lifecycleController.signal });
 
@@ -1980,8 +1781,7 @@ class MathPlotModal extends Modal {
   onOpen() {
     const contentEl = this.contentEl;
     contentEl.empty();
-    this.modalEl.style.width = "85vw";
-    this.modalEl.style.maxWidth = "950px";
+    this.modalEl.classList.add("math-plot-modal");
 
     contentEl.createEl("h2", { text: "Math Plotter - New Graph" });
 
