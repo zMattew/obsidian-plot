@@ -1,6 +1,30 @@
-const { Plugin, Modal, renderMath, finishRenderMath } = require("obsidian");
+import { App, finishRenderMath, MarkdownPostProcessorContext, Modal, Plugin, renderMath, TFile } from "obsidian";
+import type { MathPlotConfig } from "./types";
 
-module.exports = class MultiPlotterPlugin extends Plugin {
+interface PlotRowElement {
+  row: HTMLDivElement;
+  colorPickerWrapper: HTMLDivElement;
+  colorBadge: HTMLDivElement;
+  colorBox: HTMLInputElement;
+  bodyContainer: HTMLDivElement;
+  type: string;
+  color: string;
+  opacity: number;
+  visible: boolean;
+  labelInput: HTMLInputElement;
+  input: HTMLInputElement | null;
+  dirInput: HTMLInputElement | null;
+  name?: string;
+  value?: number;
+  min?: number;
+  max?: number;
+  step?: number;
+  previewEl?: HTMLDivElement;
+}
+
+export default class MultiPlotterPlugin extends Plugin {
+  blockRegistry: WeakMap<HTMLElement, { skipNextRender: boolean }> = new WeakMap();
+
   async onload() {
     this.blockRegistry = new WeakMap();
 
@@ -21,7 +45,7 @@ module.exports = class MultiPlotterPlugin extends Plugin {
         return;
       }
 
-      let config = {
+      let config: MathPlotConfig = {
         type: "3d",
         renderStyle: "wireframe",
         resolution: 50,
@@ -48,7 +72,7 @@ module.exports = class MultiPlotterPlugin extends Plugin {
     });
   }
 
-  parseConfig(raw) {
+  parseConfig(raw: string): MathPlotConfig {
     try {
       const parsed = JSON.parse(raw);
       if (!parsed.items) parsed.items = [];
@@ -79,7 +103,7 @@ module.exports = class MultiPlotterPlugin extends Plugin {
     return res;
   }
 
-  attachLatexSuiteShortcuts(inputEl, onUpdate) {
+  attachLatexSuiteShortcuts(inputEl: HTMLInputElement, onUpdate: () => void) {
     const snippets = [
       { trigger: "->", replace: "\\to " },
       { trigger: "|->", replace: "\\mapsto " },
@@ -119,7 +143,7 @@ module.exports = class MultiPlotterPlugin extends Plugin {
     });
   }
 
-  latexToJS(latex, vars = {}) {
+  latexToJS(latex: string, vars: Record<string, number> = {}): (x: number, y: number) => number | null {
     let expr = (latex || "").trim();
     if (!expr) return () => null;
 
@@ -158,13 +182,13 @@ module.exports = class MultiPlotterPlugin extends Plugin {
     expr = expr.replace(/([xXyY\)])(Math\.)/g, "$1*$2");
 
     try {
-      return new Function("x", "y", "try { const val = Number(" + expr + "); return isFinite(val) ? val : null; } catch(e) { return null; }");
+      return new Function("x", "y", "try { const val = Number(" + expr + "); return isFinite(val) ? val : null; } catch(e) { return null; }") as (x: number, y: number) => number | null;
     } catch (e) {
       return () => null;
     }
   }
 
-  evalVectorExpr(exprStr, vars = {}) {
+  evalVectorExpr(exprStr: string, vars: Record<string, number> = {}): number[] {
     if (!exprStr) return [0, 0, 0];
     const parts = exprStr.split(",").map(p => p.trim());
     return parts.map(p => {
@@ -174,7 +198,12 @@ module.exports = class MultiPlotterPlugin extends Plugin {
     });
   }
 
-  buildUI(rootEl, initialConfig, ctx, onInsertCallback) {
+  buildUI(
+    rootEl: HTMLElement,
+    initialConfig: MathPlotConfig,
+    ctx: MarkdownPostProcessorContext | null,
+    onInsertCallback: ((markdown: string) => void) | null
+  ) {
     rootEl.empty();
 
     const wrapper = rootEl.createDiv({ cls: "math-plot-container" });
@@ -319,7 +348,7 @@ module.exports = class MultiPlotterPlugin extends Plugin {
     ];
     resOptions.forEach(r => {
       const opt = document.createElement("option");
-      opt.value = r.val;
+      opt.value = String(r.val);
       opt.text = r.label;
       if (r.val === state.resolution) opt.selected = true;
       resSelect.appendChild(opt);
@@ -376,7 +405,7 @@ module.exports = class MultiPlotterPlugin extends Plugin {
       wrap.createSpan({ text: name.toUpperCase() }).style.fontSize = "12px";
 
       cb.addEventListener("change", (e) => {
-        state.axesEnabled[name] = e.target.checked;
+        state.axesEnabled[name] = (e.target as HTMLInputElement).checked;
         this.drawCanvas(canvas, state);
         debouncedSave();
       });
@@ -547,7 +576,7 @@ module.exports = class MultiPlotterPlugin extends Plugin {
       saveTimer = setTimeout(async () => {
         try {
           const file = this.app.vault.getAbstractFileByPath(ctx.sourcePath);
-          if (!file) return;
+          if (!(file instanceof TFile)) return;
 
           const section = ctx.getSectionInfo(rootEl);
           if (!section) return;
@@ -600,7 +629,7 @@ module.exports = class MultiPlotterPlugin extends Plugin {
     });
 
     typeSelect.addEventListener("change", (e) => {
-      state.type = e.target.value;
+      state.type = (e.target as HTMLSelectElement).value as MathPlotConfig["type"];
       state.bounds = state.type === "2d" ? [-8, 8] : [-4, 4, -4, 4];
       zWrap.style.display = state.type === "3d" ? "flex" : "none";
       this.drawCanvas(canvas, state);
@@ -608,31 +637,31 @@ module.exports = class MultiPlotterPlugin extends Plugin {
     });
 
     styleSelect.addEventListener("change", (e) => {
-      state.renderStyle = e.target.value;
+      state.renderStyle = (e.target as HTMLSelectElement).value as NonNullable<MathPlotConfig["renderStyle"]>;
       this.drawCanvas(canvas, state);
       debouncedSave();
     });
 
     resSelect.addEventListener("change", (e) => {
-      state.resolution = Number(e.target.value);
+      state.resolution = Number((e.target as HTMLSelectElement).value);
       this.drawCanvas(canvas, state);
       debouncedSave();
     });
 
     axisModeSelect.addEventListener("change", (e) => {
-      state.axisMode = e.target.value;
+      state.axisMode = (e.target as HTMLSelectElement).value as NonNullable<MathPlotConfig["axisMode"]>;
       this.drawCanvas(canvas, state);
       debouncedSave();
     });
 
     axisNumToggle.addEventListener("change", (e) => {
-      state.showAxisNumbers = e.target.checked;
+      state.showAxisNumbers = (e.target as HTMLInputElement).checked;
       this.drawCanvas(canvas, state);
       debouncedSave();
     });
 
     isectToggle.addEventListener("change", (e) => {
-      state.showIntersections = e.target.checked;
+      state.showIntersections = (e.target as HTMLInputElement).checked;
       this.drawCanvas(canvas, state);
       debouncedSave();
     });
@@ -651,7 +680,7 @@ module.exports = class MultiPlotterPlugin extends Plugin {
       dragHandle.addEventListener("dragend", () => {
         draggedRowEl = null;
         rowEl.style.opacity = "1";
-        rowsContainer.querySelectorAll(".math-row").forEach(r => r.style.borderTop = "");
+        rowsContainer.querySelectorAll<HTMLElement>(".math-row").forEach(r => r.style.borderTop = "");
       });
 
       rowEl.addEventListener("dragover", (e) => {
@@ -784,9 +813,9 @@ module.exports = class MultiPlotterPlugin extends Plugin {
       const alphaValueSpan = alphaHeader.createSpan();
 
       const alphaSlider = colorPopover.createEl("input", { type: "range" });
-      alphaSlider.min = 0;
-      alphaSlider.max = 1;
-      alphaSlider.step = 0.05;
+      alphaSlider.min = "0";
+      alphaSlider.max = "1";
+      alphaSlider.step = "0.05";
       alphaSlider.value = (itemData && itemData.opacity !== undefined) ? itemData.opacity : 1.0;
       alphaSlider.style.width = "100%";
       alphaSlider.style.cursor = "pointer";
@@ -817,7 +846,7 @@ module.exports = class MultiPlotterPlugin extends Plugin {
       delBtn.style.padding = "4px 8px";
       delBtn.style.flexShrink = "0";
 
-      const itemRef = {
+      const itemRef: PlotRowElement = {
         row,
         colorPickerWrapper,
         colorBadge,
@@ -835,7 +864,7 @@ module.exports = class MultiPlotterPlugin extends Plugin {
 
       const updateBadgeVisual = () => {
         colorBadge.style.backgroundColor = itemRef.color;
-        colorBadge.style.opacity = Math.max(0.2, itemRef.opacity);
+        colorBadge.style.opacity = String(Math.max(0.2, itemRef.opacity));
         alphaValueSpan.setText(`${Math.round(itemRef.opacity * 100)}%`);
       };
       updateBadgeVisual();
@@ -864,7 +893,7 @@ module.exports = class MultiPlotterPlugin extends Plugin {
       });
 
       alphaSlider.addEventListener("input", (e) => {
-        itemRef.opacity = Number(e.target.value);
+        itemRef.opacity = Number((e.target as HTMLInputElement).value);
         updateBadgeVisual();
         this.drawCanvas(canvas, state);
         debouncedSave();
@@ -958,16 +987,16 @@ module.exports = class MultiPlotterPlugin extends Plugin {
         badge.style.flexShrink = "0";
 
         const numInput = bodyContainer.createEl("input", { type: "number" });
-        numInput.value = itemRef.value;
-        numInput.step = itemRef.step;
+        numInput.value = String(itemRef.value);
+        numInput.step = String(itemRef.step);
         numInput.style.width = "65px";
         numInput.style.flexShrink = "0";
 
         const slider = bodyContainer.createEl("input", { type: "range" });
-        slider.min = itemRef.min;
-        slider.max = itemRef.max;
-        slider.step = itemRef.step;
-        slider.value = itemRef.value;
+        slider.min = String(itemRef.min);
+        slider.max = String(itemRef.max);
+        slider.step = String(itemRef.step);
+        slider.value = String(itemRef.value);
         slider.style.flex = "1";
         slider.style.minWidth = "0";
         slider.style.cursor = "pointer";
@@ -982,8 +1011,8 @@ module.exports = class MultiPlotterPlugin extends Plugin {
           debouncedSave();
         };
 
-        slider.addEventListener("input", (e) => onVal(e.target.value));
-        numInput.addEventListener("input", (e) => onVal(e.target.value));
+        slider.addEventListener("input", (e) => onVal((e.target as HTMLInputElement).value));
+        numInput.addEventListener("input", (e) => onVal((e.target as HTMLInputElement).value));
         return;
       }
 
@@ -1820,10 +1849,13 @@ module.exports = class MultiPlotterPlugin extends Plugin {
       ctx.fillText(text, px + 6 + padX, py);
     });
   }
-};
+}
 
 class MathPlotModal extends Modal {
-  constructor(app, plugin, onInsert) {
+  plugin: MultiPlotterPlugin;
+  onInsert: (markdown: string) => void;
+
+  constructor(app: App, plugin: MultiPlotterPlugin, onInsert: (markdown: string) => void) {
     super(app);
     this.plugin = plugin;
     this.onInsert = onInsert;
@@ -1837,7 +1869,7 @@ class MathPlotModal extends Modal {
 
     contentEl.createEl("h2", { text: "Math Plotter - New Graph" });
 
-    const freshConfig = {
+    const freshConfig: MathPlotConfig = {
       type: "3d",
       renderStyle: "wireframe",
       resolution: 50,

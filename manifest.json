@@ -1,9 +1,9 @@
 {
-  "id": "obsidian-json-plotter",
-  "name": "JSON Multi Math Plotter",
-  "version": "1.0.0",
+  "id": "obsidian-plot",
+  "name": "Plot",
+  "version": "0.1.0",
   "minAppVersion": "0.15.0",
-  "description": "Interactive 2D/3D math equation plotter with UI for Obsidian",
-  "author": "Custom",
+  "description": "Interactive 2D/3D math equation plotter with UI",
+  "author": "zMattew_",
   "isDesktopOnly": false
 }
