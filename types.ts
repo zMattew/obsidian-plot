@@ -20,7 +20,7 @@ export type HexColor = string;
  */
 export interface PlotVariable {
   type: "var";
-  /** Variable identifier (single letter: a-w, excluding reserved axis variables x, y, z). */
+  /** Variable identifier (letter followed by up to 31 letters, digits, or underscores; axes, constants, and function names are reserved). */
   name: string;
   /** Initial numeric value. */
   value: number;

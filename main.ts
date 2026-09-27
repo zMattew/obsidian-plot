@@ -1,4 +1,5 @@
-import { App, finishRenderMath, MarkdownPostProcessorContext, Modal, Plugin, renderMath, TFile } from "obsidian";
+import { parse } from "mathjs";
+import { App, finishRenderMath, MarkdownPostProcessorContext, MarkdownRenderChild, Modal, Plugin, renderMath, TFile } from "obsidian";
 import type { MathPlotConfig } from "./types";
 
 interface PlotRowElement {
@@ -22,8 +23,23 @@ interface PlotRowElement {
   previewEl?: HTMLDivElement;
 }
 
+const ALLOWED_MATH_FUNCTIONS = new Set([
+  "abs", "acos", "asin", "atan", "ceil", "cos", "cosh", "exp", "floor", "log", "max", "min",
+  "pow", "round", "sign", "sin", "sinh", "sqrt", "tan", "tanh"
+]);
+const ALLOWED_MATH_OPERATORS = new Set(["+", "-", "*", "/", "%", "^"]);
+const RESERVED_VARIABLE_NAMES = new Set(["x", "y", "z", "e", "pi"]);
+
+function isValidVariableName(name: string): boolean {
+  const normalizedName = name.toLowerCase();
+  return /^[a-z][a-z0-9_]{0,31}$/i.test(name) &&
+    !RESERVED_VARIABLE_NAMES.has(normalizedName) &&
+    !ALLOWED_MATH_FUNCTIONS.has(normalizedName);
+}
+
 export default class MultiPlotterPlugin extends Plugin {
   blockRegistry: WeakMap<HTMLElement, { skipNextRender: boolean }> = new WeakMap();
+  private compiledExpressions = new Map<string, ((scope: Record<string, number>) => unknown) | null>();
 
   async onload() {
     this.blockRegistry = new WeakMap();
@@ -73,34 +89,77 @@ export default class MultiPlotterPlugin extends Plugin {
   }
 
   parseConfig(raw: string): MathPlotConfig {
+    let parsed: any;
     try {
-      const parsed = JSON.parse(raw);
-      if (!parsed.items) parsed.items = [];
-      return parsed;
+      parsed = JSON.parse(raw);
     } catch (_) {}
 
-    let sanitized = "";
-    let inString = false;
-    for (let i = 0; i < raw.length; i++) {
-      const char = raw[i];
-      if (char === '"' && raw[i - 1] !== "\\") {
-        inString = !inString;
-        sanitized += char;
-      } else if (inString && char === "\\") {
-        const next = raw[i + 1];
-        if (next === '"' || next === "\\" || next === "/" || next === "b" || next === "f" || next === "n" || next === "r" || next === "t") {
+    if (parsed === undefined) {
+      let sanitized = "";
+      let inString = false;
+      for (let i = 0; i < raw.length; i++) {
+        const char = raw[i];
+        if (char === '"' && raw[i - 1] !== "\\") {
+          inString = !inString;
           sanitized += char;
+        } else if (inString && char === "\\") {
+          const next = raw[i + 1];
+          if (next === '"' || next === "\\" || next === "/" || next === "b" || next === "f" || next === "n" || next === "r" || next === "t") {
+            sanitized += char;
+          } else {
+            sanitized += "\\\\";
+          }
         } else {
-          sanitized += "\\\\";
+          sanitized += char;
         }
-      } else {
-        sanitized += char;
       }
+      parsed = JSON.parse(sanitized);
     }
 
-    const res = JSON.parse(sanitized);
-    if (!res.items) res.items = [];
-    return res;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("Configuration must be a JSON object.");
+    }
+    if (parsed.items === undefined) parsed.items = [];
+    if (!Array.isArray(parsed.items)) throw new Error("'items' must be an array.");
+    if (parsed.type !== undefined && parsed.type !== "2d" && parsed.type !== "3d") {
+      throw new Error("'type' must be '2d' or '3d'.");
+    }
+    if (parsed.renderStyle !== undefined && !["wireframe", "solid", "points"].includes(parsed.renderStyle)) {
+      throw new Error("'renderStyle' must be 'wireframe', 'solid' or 'points'.");
+    }
+    if (parsed.axisMode !== undefined && !["ticks", "grid", "none"].includes(parsed.axisMode)) {
+      throw new Error("'axisMode' must be 'ticks', 'grid' or 'none'.");
+    }
+    if (parsed.resolution !== undefined && (!Number.isFinite(parsed.resolution) || parsed.resolution < 1)) {
+      throw new Error("'resolution' must be a positive finite number.");
+    }
+    if (parsed.bounds !== undefined && (!Array.isArray(parsed.bounds) || ![2, 4].includes(parsed.bounds.length) ||
+      !parsed.bounds.every(Number.isFinite) || parsed.bounds[0] >= parsed.bounds[1] ||
+      (parsed.bounds.length === 4 && parsed.bounds[2] >= parsed.bounds[3]))) {
+      throw new Error("'bounds' must contain two or four finite values in ascending order.");
+    }
+
+    parsed.items.forEach((item: any, index: number) => {
+      const prefix = `Item ${index + 1}`;
+      if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error(`${prefix} must be an object.`);
+      if (item.type === "var") {
+        if (typeof item.name !== "string" || !isValidVariableName(item.name) || !Number.isFinite(item.value)) {
+          throw new Error(`${prefix} must have a valid non-reserved variable name and finite value.`);
+        }
+      } else if (item.type === "fn") {
+        if (typeof item.fn !== "string") throw new Error(`${prefix} must have a string 'fn'.`);
+      } else if (item.type === "point") {
+        if (typeof item.coords !== "string") throw new Error(`${prefix} must have string 'coords'.`);
+      } else if (item.type === "vector") {
+        if (typeof item.origin !== "string" || typeof item.dir !== "string") {
+          throw new Error(`${prefix} must have string 'origin' and 'dir'.`);
+        }
+      } else {
+        throw new Error(`${prefix} has an unsupported type.`);
+      }
+    });
+
+    return parsed as MathPlotConfig;
   }
 
   attachLatexSuiteShortcuts(inputEl: HTMLInputElement, onUpdate: () => void) {
@@ -144,48 +203,81 @@ export default class MultiPlotterPlugin extends Plugin {
   }
 
   latexToJS(latex: string, vars: Record<string, number> = {}): (x: number, y: number) => number | null {
-    let expr = (latex || "").trim();
-    if (!expr) return () => null;
+    const source = (latex || "").trim();
+    if (!source) return () => null;
 
-    expr = expr.replace(/^(z|y|f\([xXyY,\s]+\))\s*=\s*/i, "");
-    expr = expr.replace(/\^\{([^}]+)\}/g, "**($1)");
-    expr = expr.replace(/\^([a-zA-Z0-9])/g, "**$1");
+    const cacheKey = `${source}\u0000${Object.keys(vars).sort().join(",")}`;
+    let evaluate = this.compiledExpressions.get(cacheKey);
+    if (evaluate === undefined) {
+      let expr = source.replace(/^(z|y|f\([xXyY,\s]+\))\s*=\s*/i, "");
+      while (/\\sqrt\{([^}]+)\}/.test(expr)) {
+        expr = expr.replace(/\\sqrt\{([^}]+)\}/g, "sqrt(($1))");
+      }
+      expr = expr.replace(/\\sqrt\s*([a-zA-Z0-9])/g, "sqrt($1)");
 
-    while (/\\sqrt\{([^}]+)\}/.test(expr)) {
-      expr = expr.replace(/\\sqrt\{([^}]+)\}/g, "Math.sqrt(($1))");
+      while (/\\frac\{([^}]+)\}\{([^}]+)\}/.test(expr)) {
+        expr = expr.replace(/\\frac\{([^}]+)\}\{([^}]+)\}/g, "(($1)/($2))");
+      }
+
+      expr = expr.replace(/\\ln\b/g, "log");
+      expr = expr.replace(/\\(sin|cos|tan|asin|acos|atan|sinh|cosh|tanh|exp|log|abs)/g, "$1");
+      expr = expr.replace(/\\cdot|\\times/g, "*");
+      expr = expr.replace(/\\pi/g, "pi");
+      expr = expr.replace(/\\left|\\right/g, "");
+      expr = expr.replace(/\bMath\.PI\b/gi, "pi").replace(/\bMath\.E\b/g, "e");
+      expr = expr.replace(/\bMath\./g, "");
+      expr = expr.replace(/\{/g, "(").replace(/\}/g, ")");
+      expr = expr.replace(/([xXyY])\s+([xXyY])/g, "$1*$2");
+
+      try {
+        const node = parse(expr);
+        const allowedSymbols = new Set(["e", "pi", "x", "y", ...Object.keys(vars), ...ALLOWED_MATH_FUNCTIONS]);
+        let isSafe = true;
+
+        node.traverse((child) => {
+          const childNode = child as { type: string; name?: string; op?: string };
+          if (childNode.type === "ConstantNode" || childNode.type === "ParenthesisNode") return;
+          if (childNode.type === "SymbolNode") {
+            if (!allowedSymbols.has(childNode.name || "")) isSafe = false;
+            return;
+          }
+          if (childNode.type === "OperatorNode") {
+            if (!ALLOWED_MATH_OPERATORS.has(childNode.op || "")) isSafe = false;
+            return;
+          }
+          if (childNode.type === "FunctionNode") {
+            if (!ALLOWED_MATH_FUNCTIONS.has(childNode.name || "")) isSafe = false;
+            return;
+          }
+          isSafe = false;
+        });
+
+        if (isSafe) {
+          const compiled = node.compile();
+          evaluate = (scope) => compiled.evaluate(scope);
+        } else {
+          evaluate = null;
+        }
+      } catch (_) {
+        evaluate = null;
+      }
+
+      this.compiledExpressions.set(cacheKey, evaluate);
+      if (this.compiledExpressions.size > 256) {
+        const oldestKey = this.compiledExpressions.keys().next().value;
+        if (oldestKey !== undefined) this.compiledExpressions.delete(oldestKey);
+      }
     }
-    expr = expr.replace(/\\sqrt\s*([a-zA-Z0-9])/g, "Math.sqrt($1)");
 
-    while (/\\frac\{([^}]+)\}\{([^}]+)\}/.test(expr)) {
-      expr = expr.replace(/\\frac\{([^}]+)\}\{([^}]+)\}/g, "(($1)/($2))");
-    }
-
-    expr = expr.replace(/\\(sin|cos|tan|asin|acos|atan|sinh|cosh|tanh|exp|log|ln|abs)/g, "$1");
-    expr = expr.replace(/\\cdot/g, "*");
-    expr = expr.replace(/\\pi/g, "Math.PI");
-
-    expr = expr.replace(/\b(sin|cos|tan|asin|acos|atan|sinh|cosh|tanh|exp|abs)\b/g, "Math.$1");
-    expr = expr.replace(/\b(ln|log)\b/g, "Math.log");
-    expr = expr.replace(/\bpi\b/gi, "Math.PI");
-
-    expr = expr.replace(/\{/g, "(").replace(/\}/g, ")");
-
-    for (const [varName, val] of Object.entries(vars)) {
-      const re = new RegExp(`\\b${varName}\\b`, "g");
-      expr = expr.replace(re, `(${Number(val)})`);
-    }
-
-    expr = expr.replace(/(\d)([a-zA-Z\(])/g, "$1*$2");
-    expr = expr.replace(/([xXyY\)])(\d)/g, "$1*$2");
-    expr = expr.replace(/([xXyY])\s+([xXyY])/g, "$1*$2");
-    expr = expr.replace(/\)\s*\(/g, ")*(");
-    expr = expr.replace(/([xXyY\)])(Math\.)/g, "$1*$2");
-
-    try {
-      return new Function("x", "y", "try { const val = Number(" + expr + "); return isFinite(val) ? val : null; } catch(e) { return null; }") as (x: number, y: number) => number | null;
-    } catch (e) {
-      return () => null;
-    }
+    if (!evaluate) return () => null;
+    return (x: number, y: number) => {
+      try {
+        const value = evaluate({ ...vars, x, y });
+        return typeof value === "number" && Number.isFinite(value) ? value : null;
+      } catch (_) {
+        return null;
+      }
+    };
   }
 
   evalVectorExpr(exprStr: string, vars: Record<string, number> = {}): number[] {
@@ -203,7 +295,8 @@ export default class MultiPlotterPlugin extends Plugin {
     initialConfig: MathPlotConfig,
     ctx: MarkdownPostProcessorContext | null,
     onInsertCallback: ((markdown: string) => void) | null
-  ) {
+  ): () => void {
+    const lifecycleController = new AbortController();
     rootEl.empty();
 
     const wrapper = rootEl.createDiv({ cls: "math-plot-container" });
@@ -267,7 +360,7 @@ export default class MultiPlotterPlugin extends Plugin {
         menuBtn.setText("⚙ Plot options ▾");
       }
     };
-    document.addEventListener("click", closeDropdownHandler);
+    document.addEventListener("click", closeDropdownHandler, { signal: lifecycleController.signal });
 
     const defaultAxes = { x: true, y: true, z: true };
     const initialCam = initialConfig.camera || {};
@@ -343,6 +436,7 @@ export default class MultiPlotterPlugin extends Plugin {
     const resOptions = [
       { val: 24, label: "Low (24)" },
       { val: 40, label: "Medium (40)" },
+      { val: 50, label: "Default (50)" },
       { val: 60, label: "High (60)" },
       { val: 80, label: "Ultra (80)" }
     ];
@@ -575,6 +669,7 @@ export default class MultiPlotterPlugin extends Plugin {
       clearTimeout(saveTimer);
       saveTimer = setTimeout(async () => {
         try {
+          if (lifecycleController.signal.aborted) return;
           const file = this.app.vault.getAbstractFileByPath(ctx.sourcePath);
           if (!(file instanceof TFile)) return;
 
@@ -582,6 +677,7 @@ export default class MultiPlotterPlugin extends Plugin {
           if (!section) return;
 
           const content = await this.app.vault.read(file);
+          if (lifecycleController.signal.aborted) return;
           const lines = content.split("\n");
 
           const newBlock = [
@@ -825,7 +921,7 @@ export default class MultiPlotterPlugin extends Plugin {
         colorPopover.style.display = colorPopover.style.display === "none" ? "flex" : "none";
       });
       colorPopover.addEventListener("click", (e) => e.stopPropagation());
-      document.addEventListener("click", () => colorPopover.style.display = "none");
+      document.addEventListener("click", () => colorPopover.style.display = "none", { signal: lifecycleController.signal });
 
       const bodyContainer = row.createDiv();
       bodyContainer.style.flex = "1";
@@ -1059,12 +1155,12 @@ export default class MultiPlotterPlugin extends Plugin {
       previewEl.addEventListener("click", () => setMode(true));
 
       const testAndTransformSlider = () => {
+        if (transformedToSlider) return true;
         const txt = input.value.trim();
-        const match = txt.match(/^([a-zA-Z])\s*=\s*(-?\d*\.?\d+)$/);
+        const match = txt.match(/^([a-zA-Z][a-zA-Z0-9_]*)\s*=\s*(-?\d*\.?\d+)$/);
         if (match) {
-          const varName = match[1].toLowerCase();
-          const reservedVar = state.type === "3d" ? "z" : "y";
-          if (varName === reservedVar) return false;
+          if (!isValidVariableName(match[1])) return false;
+          transformedToSlider = true;
           row.remove();
           state.rows = state.rows.filter(r => r !== itemRef);
           createRow({ type: "var", name: match[1], value: parseFloat(match[2]), min: -5, max: 5, step: 0.1 });
@@ -1075,6 +1171,7 @@ export default class MultiPlotterPlugin extends Plugin {
         return false;
       };
 
+      let transformedToSlider = false;
       input.addEventListener("input", () => {
         if (!testAndTransformSlider()) {
           this.drawCanvas(canvas, state);
@@ -1093,10 +1190,8 @@ export default class MultiPlotterPlugin extends Plugin {
       });
 
       this.attachLatexSuiteShortcuts(input, () => {
-        if (!testAndTransformSlider()) {
-          this.drawCanvas(canvas, state);
-          debouncedSave();
-        }
+        this.drawCanvas(canvas, state);
+        debouncedSave();
       });
     };
 
@@ -1128,6 +1223,14 @@ export default class MultiPlotterPlugin extends Plugin {
     let isPanning = false;
     let lastX = 0;
     let lastY = 0;
+    let drawFrame = 0;
+    const scheduleDraw = () => {
+      if (drawFrame) return;
+      drawFrame = window.requestAnimationFrame(() => {
+        drawFrame = 0;
+        if (canvas.isConnected) this.drawCanvas(canvas, state);
+      });
+    };
 
     canvas.addEventListener("mousedown", (e) => {
       if (state.locked) return;
@@ -1157,8 +1260,8 @@ export default class MultiPlotterPlugin extends Plugin {
 
       lastX = e.clientX;
       lastY = e.clientY;
-      this.drawCanvas(canvas, state);
-    });
+      scheduleDraw();
+    }, { signal: lifecycleController.signal });
 
     window.addEventListener("mouseup", () => {
       if (isDragging) {
@@ -1166,12 +1269,12 @@ export default class MultiPlotterPlugin extends Plugin {
         isPanning = false;
         canvas.style.cursor = state.locked ? "not-allowed" : "grab";
       }
-    });
+    }, { signal: lifecycleController.signal });
 
     canvas.addEventListener("wheel", (e) => {
       if (state.locked) return;
       e.preventDefault();
-      state.scale *= e.deltaY > 0 ? 0.9 : 1.1;
+      state.scale = Math.max(2, Math.min(200, state.scale * (e.deltaY > 0 ? 0.9 : 1.1)));
       this.drawCanvas(canvas, state);
     });
 
@@ -1187,7 +1290,20 @@ export default class MultiPlotterPlugin extends Plugin {
       });
     }
 
-    setTimeout(() => this.drawCanvas(canvas, state), 50);
+    const initialDrawTimer = window.setTimeout(() => this.drawCanvas(canvas, state), 50);
+
+    const cleanup = () => {
+      lifecycleController.abort();
+      if (drawFrame) window.cancelAnimationFrame(drawFrame);
+      if (saveTimer) clearTimeout(saveTimer);
+      clearTimeout(initialDrawTimer);
+    };
+    if (ctx) {
+      const renderChild = new MarkdownRenderChild(rootEl);
+      renderChild.register(cleanup);
+      ctx.addChild(renderChild);
+    }
+    return cleanup;
   }
 
   drawCanvas(canvas, state) {
@@ -1399,8 +1515,7 @@ export default class MultiPlotterPlugin extends Plugin {
         ctx.beginPath();
 
         let started = false;
-        let midPx = cx;
-        let midPy = cy;
+        let labelPoint: { px: number; py: number } | null = null;
 
         for (let px = 0; px <= w; px += 2) {
           const mathX = (px - cx) / pxPerX;
@@ -1409,13 +1524,13 @@ export default class MultiPlotterPlugin extends Plugin {
             const py = cy - mathY * pyPerY;
             if (!started) { ctx.moveTo(px, py); started = true; }
             else { ctx.lineTo(px, py); }
-            if (px >= cx && !midPx) { midPx = px; midPy = py; }
+            if (px >= cx && !labelPoint) labelPoint = { px, py };
           } else {
             started = false;
           }
         }
         ctx.stroke();
-        queueLabel(label, midPx, midPy, col);
+        if (labelPoint) queueLabel(label, labelPoint.px, labelPoint.py, col);
       });
 
     } else {
@@ -1854,6 +1969,7 @@ export default class MultiPlotterPlugin extends Plugin {
 class MathPlotModal extends Modal {
   plugin: MultiPlotterPlugin;
   onInsert: (markdown: string) => void;
+  private disposeUI: (() => void) | null = null;
 
   constructor(app: App, plugin: MultiPlotterPlugin, onInsert: (markdown: string) => void) {
     super(app);
@@ -1887,13 +2003,15 @@ class MathPlotModal extends Modal {
       ]
     };
 
-    this.plugin.buildUI(contentEl, freshConfig, null, (markdown) => {
+    this.disposeUI = this.plugin.buildUI(contentEl, freshConfig, null, (markdown) => {
       this.onInsert(markdown);
       this.close();
     });
   }
 
   onClose() {
+    this.disposeUI?.();
+    this.disposeUI = null;
     this.contentEl.empty();
   }
 }

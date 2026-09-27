@@ -1,5 +1,5 @@
 {
-  "name": "obsidian-json-plotter",
+  "name": "obsidian-plot",
   "version": "1.0.0",
   "private": true,
   "scripts": {
@@ -11,5 +11,8 @@
     "esbuild": "^0.25.0",
     "obsidian": "^1.8.7",
     "typescript": "^5.7.3"
+  },
+  "dependencies": {
+    "mathjs": "^15.2.0"
   }
 }
