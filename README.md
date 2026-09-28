@@ -63,7 +63,7 @@ Use `"type": "2d"` for a 2D graph. In 3D, `bounds` is `[xMin, xMax, yMin, yMax]`
 
 Supported expressions include arithmetic, powers, implicit multiplication, and constants `pi` and `e`. Function calls use LaTeX commands such as `\\sqrt{x}`, `\\sin(x)`, and `\\max{(a,b)}`; absolute values use `|x|`. Raw calls such as `max(x, y)` and `abs(x)` are not accepted.
 
-Implicit 3D surfaces use an `implicit` item with an equation `F(x,y,z)=0`. Existing `fn` items containing a `z`-dependent equality are detected automatically too. Six-value 3D bounds optionally set the x, y, and z intervals:
+Implicit 3D surfaces use an `implicit` item with an equation `F(x,y,z)=0`. Existing `fn` items containing a `z`-dependent equality are detected automatically too. Their sampling volume expands automatically when the zero surface crosses one of its faces, so explicit bounds are normally unnecessary. Six-value 3D bounds can still set the starting x, y, and z intervals:
 
 ```json
 {

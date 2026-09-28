@@ -200,6 +200,67 @@ function unwrapOuterParentheses(expression: string): string {
   return depth === 0 ? trimmed.slice(1, -1) : expression;
 }
 
+type ImplicitBounds = [number, number, number, number, number, number];
+
+function expandImplicitBounds(
+  field: (x: number, y: number, z: number) => number | null,
+  initialBounds: ImplicitBounds
+): ImplicitBounds {
+  const bounds = initialBounds.slice() as ImplicitBounds;
+  const faceSamples = 12;
+
+  for (let pass = 0; pass < 5; pass++) {
+    const expandLow = [false, false, false];
+    const expandHigh = [false, false, false];
+
+    for (let axis = 0; axis < 3; axis++) {
+      for (const highSide of [false, true]) {
+        const faceCoordinate = bounds[axis * 2 + (highSide ? 1 : 0)];
+        let minValue = Number.POSITIVE_INFINITY;
+        let maxValue = Number.NEGATIVE_INFINITY;
+
+        for (let u = 0; u <= faceSamples; u++) {
+          for (let v = 0; v <= faceSamples; v++) {
+            const coordinates = [0, 0, 0];
+            coordinates[axis] = faceCoordinate;
+            let otherAxis = 0;
+            for (let coordinateAxis = 0; coordinateAxis < 3; coordinateAxis++) {
+              if (coordinateAxis === axis) continue;
+              const min = bounds[coordinateAxis * 2];
+              const max = bounds[coordinateAxis * 2 + 1];
+              coordinates[coordinateAxis] = otherAxis === 0
+                ? min + (max - min) * u / faceSamples
+                : min + (max - min) * v / faceSamples;
+              otherAxis++;
+            }
+
+            const value = field(coordinates[0], coordinates[1], coordinates[2]);
+            if (value === null) continue;
+            minValue = Math.min(minValue, value);
+            maxValue = Math.max(maxValue, value);
+          }
+        }
+
+        if (minValue <= 0 && maxValue >= 0) {
+          if (highSide) expandHigh[axis] = true;
+          else expandLow[axis] = true;
+        }
+      }
+    }
+
+    if (![...expandLow, ...expandHigh].some(Boolean)) break;
+
+    for (let axis = 0; axis < 3; axis++) {
+      const span = bounds[axis * 2 + 1] - bounds[axis * 2];
+      const margin = Math.max(span * 0.5, 1);
+      if (expandLow[axis]) bounds[axis * 2] -= margin;
+      if (expandHigh[axis]) bounds[axis * 2 + 1] += margin;
+    }
+  }
+
+  return bounds;
+}
+
 export default class MultiPlotterPlugin extends Plugin {
   blockRegistry: WeakMap<HTMLElement, { skipNextRender: boolean }> = new WeakMap();
   private compiledExpressions = new Map<string, ((scope: Record<string, number>) => unknown) | null>();
@@ -1155,16 +1216,28 @@ export default class MultiPlotterPlugin extends Plugin {
 
         slider.addEventListener("mousedown", (e) => e.stopPropagation());
 
-        const onVal = (val: string): void => {
+        let pendingVariableDraw = 0;
+        const onVal = (val: string, interactive = false): void => {
           itemRef.value = Number(val);
           slider.value = val;
           numInput.value = val;
-          this.drawCanvas(canvas, state);
+          if (pendingVariableDraw) window.cancelAnimationFrame(pendingVariableDraw);
+          if (interactive) {
+            pendingVariableDraw = window.requestAnimationFrame(() => {
+              pendingVariableDraw = 0;
+              this.drawCanvas(canvas, state, true);
+            });
+          } else {
+            pendingVariableDraw = 0;
+            this.drawCanvas(canvas, state);
+          }
           debouncedSave();
         };
 
-        slider.addEventListener("input", (e) => onVal((e.target as HTMLInputElement).value));
-        numInput.addEventListener("input", (e) => onVal((e.target as HTMLInputElement).value));
+        slider.addEventListener("input", (e) => onVal((e.target as HTMLInputElement).value, true));
+        slider.addEventListener("change", (e) => onVal((e.target as HTMLInputElement).value));
+        numInput.addEventListener("input", (e) => onVal((e.target as HTMLInputElement).value, true));
+        numInput.addEventListener("change", (e) => onVal((e.target as HTMLInputElement).value));
         return;
       }
 
@@ -1358,7 +1431,7 @@ export default class MultiPlotterPlugin extends Plugin {
     return cleanup;
   }
 
-  drawCanvas(canvas: HTMLCanvasElement, state: PlotUIState): void {
+  drawCanvas(canvas: HTMLCanvasElement, state: PlotUIState, interactive = false): void {
     const rect = canvas.getBoundingClientRect();
     if (!rect || rect.width === 0 || rect.height === 0) return;
 
@@ -1579,10 +1652,35 @@ export default class MultiPlotterPlugin extends Plugin {
     } else {
       // 3D
       const bounds = state.bounds.length >= 4 ? state.bounds : [-4, 4, -4, 4];
-      const xMin = bounds[0];
-      const xMax = bounds[1];
-      const yMin = bounds[2];
-      const yMax = bounds[3];
+      let xMin = bounds[0];
+      let xMax = bounds[1];
+      let yMin = bounds[2];
+      let yMax = bounds[3];
+      const initialZMin = bounds.length >= 6 ? bounds[4] : -4;
+      const initialZMax = bounds.length >= 6 ? bounds[5] : 4;
+      let zMax = initialZMax;
+      const implicitVolumes = new Map<PlotRowElement, {
+        field: (x: number, y: number, z: number) => number | null;
+        bounds: ImplicitBounds;
+      }>();
+
+      state.rows.forEach(row => {
+        if (!row.input || row.visible === false || row.type === "var" || row.type === "point" || row.type === "vector") return;
+        const equation = row.input.value.trim();
+        const isImplicitEquation = row.type === "implicit" ||
+          (row.type === "fn" && equation.includes("=") && /[zZ]/.test(equation) && !/^\s*z\s*=/i.test(equation));
+        if (!isImplicitEquation) return;
+
+        const field = this.latexToImplicit(equation, currentVars);
+        if (!field) return;
+        const volumeBounds = expandImplicitBounds(field, [xMin, xMax, yMin, yMax, initialZMin, initialZMax]);
+        implicitVolumes.set(row, { field, bounds: volumeBounds });
+        xMin = Math.min(xMin, volumeBounds[0]);
+        xMax = Math.max(xMax, volumeBounds[1]);
+        yMin = Math.min(yMin, volumeBounds[2]);
+        yMax = Math.max(yMax, volumeBounds[3]);
+        zMax = Math.max(zMax, volumeBounds[5]);
+      });
 
       const project = (x: number, y: number, z: number): ProjectedPoint => {
         const radX = state.rotX;
@@ -1704,7 +1802,7 @@ export default class MultiPlotterPlugin extends Plugin {
 
       drawAxis3D("x", xMax + 1, 0, 0, "X", "#e91e63");
       drawAxis3D("y", 0, yMax + 1, 0, "Y", "#4caf50");
-      drawAxis3D("z", 0, 0, 4.5, "Z", "#2196f3");
+      drawAxis3D("z", 0, 0, Math.max(4.5, zMax), "Z", "#2196f3");
 
       const steps = Math.max(16, Math.min(100, state.resolution || 50));
       const stepX = (xMax - xMin) / steps;
@@ -1788,29 +1886,32 @@ export default class MultiPlotterPlugin extends Plugin {
         const isImplicitEquation = r.type === "implicit" ||
           (r.type === "fn" && val.includes("=") && /[zZ]/.test(val) && !/^\s*z\s*=/i.test(val));
         if (isImplicitEquation) {
-          const field = this.latexToImplicit(val, currentVars);
-          if (!field) return;
-
-          const zMin = bounds.length >= 6 ? bounds[4] : -4;
-          const zMax = bounds.length >= 6 ? bounds[5] : 4;
-          const meshResolution = Math.max(24, Math.min(40, steps));
+          const implicitVolume = implicitVolumes.get(r);
+          if (!implicitVolume) return;
+          const { field, bounds: volumeBounds } = implicitVolume;
+          const meshResolution = interactive ? 12 : Math.max(24, Math.min(32, steps));
           const variableKey = Object.keys(currentVars).sort().map(name => [name, currentVars[name]]);
-          const cacheKey = JSON.stringify([val, variableKey, xMin, xMax, yMin, yMax, zMin, zMax, meshResolution]);
+          const spans = [volumeBounds[1] - volumeBounds[0], volumeBounds[3] - volumeBounds[2], volumeBounds[5] - volumeBounds[4]];
+          const longestSpan = Math.max(...spans);
+          const meshDimensions = spans.map(span => Math.max(12, Math.ceil(meshResolution * span / longestSpan))) as [number, number, number];
+          const cacheKey = JSON.stringify([val, variableKey, volumeBounds, meshDimensions]);
           let mesh = this.implicitMeshCache.get(cacheKey);
           if (!mesh) {
             try {
               mesh = surfaceNets(
-                [meshResolution, meshResolution, meshResolution],
+                meshDimensions,
                 (x, y, z) => field(x, y, z) ?? 1e6,
-                [[xMin, yMin, zMin], [xMax, yMax, zMax]]
+                [[volumeBounds[0], volumeBounds[2], volumeBounds[4]], [volumeBounds[1], volumeBounds[3], volumeBounds[5]]]
               );
             } catch {
               return;
             }
-            this.implicitMeshCache.set(cacheKey, mesh);
-            if (this.implicitMeshCache.size > 12) {
-              const oldestKey = this.implicitMeshCache.keys().next().value as string | undefined;
-              if (oldestKey !== undefined) this.implicitMeshCache.delete(oldestKey);
+            if (!interactive) {
+              this.implicitMeshCache.set(cacheKey, mesh);
+              if (this.implicitMeshCache.size > 12) {
+                const oldestKey = this.implicitMeshCache.keys().next().value as string | undefined;
+                if (oldestKey !== undefined) this.implicitMeshCache.delete(oldestKey);
+              }
             }
           }
 
