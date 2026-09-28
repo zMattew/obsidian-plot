@@ -49,6 +49,16 @@ export interface PlotFunction {
   visible?: boolean;
 }
 
+/** Implicit 3D surface described by an equation F(x, y, z) = 0. */
+export interface PlotImplicitSurface {
+  type: "implicit";
+  equation: MathExpr;
+  color?: HexColor;
+  opacity?: number;
+  label?: string;
+  visible?: boolean;
+}
+
 /**
  * Point marker plotted in 2D or 3D space with an automatic dashed reference drop-line to the z=0 plane.
  */
@@ -82,7 +92,7 @@ export interface PlotVector {
 }
 
 /** Union of all entity items supported in a plot block. */
-export type PlotItem = PlotVariable | PlotFunction | PlotPoint | PlotVector;
+export type PlotItem = PlotVariable | PlotFunction | PlotImplicitSurface | PlotPoint | PlotVector;
 
 // ============================================================================
 // CAMERA & AXES CONFIGURATION
@@ -141,9 +151,9 @@ export interface MathPlotConfig {
   /**
    * Spatial domain boundaries:
    * - 2D mode: [xMin, xMax] (e.g., [-8, 8])
-   * - 3D mode: [xMin, xMax, yMin, yMax] (e.g., [-4, 4, -4, 4])
+    * - 3D mode: [xMin, xMax, yMin, yMax], optionally followed by [zMin, zMax]
    */
-  bounds?: [number, number] | [number, number, number, number];
+  bounds?: [number, number] | [number, number, number, number] | [number, number, number, number, number, number];
   /** Initial camera pose and translation parameters. */
   camera?: PlotCamera;
   /** Ordered list of mathematical elements, variables, points, and vectors. */

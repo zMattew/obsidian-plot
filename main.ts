@@ -2,9 +2,27 @@ import { parse } from "mathjs";
 import { App, finishRenderMath, MarkdownPostProcessorContext, MarkdownRenderChild, Modal, Plugin, renderMath, TFile } from "obsidian";
 import type { AxesVisibility, MathPlotConfig, PlotItem } from "./types";
 
+declare const require: (moduleName: string) => unknown;
+
+interface Mesh {
+  positions: number[][];
+  cells: number[][];
+}
+
+interface IsosurfaceModule {
+  surfaceNets: (
+    dimensions: [number, number, number],
+    potential: (x: number, y: number, z: number) => number,
+    bounds?: [[number, number, number], [number, number, number]]
+  ) => Mesh;
+}
+
+const { surfaceNets } = require("isosurface") as IsosurfaceModule;
+
 type PlotItemData = {
   type?: PlotItem["type"];
   fn?: string;
+  equation?: string;
   coords?: string;
   origin?: string;
   dir?: string;
@@ -73,11 +91,12 @@ interface ActiveFunction {
   gridZ: Array<Array<number | null>>;
 }
 
-interface SurfacePolygon {
-  pts: [ProjectedPoint, ProjectedPoint, ProjectedPoint, ProjectedPoint];
+interface RenderedImplicitSurface {
+  points: ProjectedPoint[];
+  cells: number[][];
   color: string;
-  edgeColor: string;
-  depth: number;
+  opacity: number;
+  label: string;
 }
 
 const ALLOWED_MATH_FUNCTIONS = new Set([
@@ -110,9 +129,81 @@ function isValidVariableName(name: string): boolean {
     !ALLOWED_MATH_FUNCTIONS.has(normalizedName);
 }
 
+function replaceLatexCommandGroups(
+  expression: string,
+  command: string,
+  argumentCount: number,
+  convert: (args: string[]) => string
+): string {
+  const token = `\\${command}`;
+  let result = "";
+  let index = 0;
+
+  while (index < expression.length) {
+    const commandIndex = expression.indexOf(token, index);
+    if (commandIndex === -1) return result + expression.slice(index);
+
+    result += expression.slice(index, commandIndex);
+    let cursor = commandIndex + token.length;
+    if (/[a-zA-Z]/.test(expression[cursor] || "")) {
+      result += token;
+      index = cursor;
+      continue;
+    }
+
+    const args: string[] = [];
+    let matched = true;
+    for (let argIndex = 0; argIndex < argumentCount; argIndex++) {
+      while (/\s/.test(expression[cursor] || "")) cursor++;
+      if (expression[cursor] !== "{") {
+        matched = false;
+        break;
+      }
+
+      const start = ++cursor;
+      let depth = 1;
+      while (cursor < expression.length && depth > 0) {
+        if (expression[cursor] === "{") depth++;
+        else if (expression[cursor] === "}") depth--;
+        cursor++;
+      }
+      if (depth !== 0) {
+        matched = false;
+        break;
+      }
+      args.push(expression.slice(start, cursor - 1));
+    }
+
+    if (matched) {
+      result += convert(args);
+      index = cursor;
+    } else {
+      result += token;
+      index = commandIndex + token.length;
+    }
+  }
+
+  return result;
+}
+
+function unwrapOuterParentheses(expression: string): string {
+  const trimmed = expression.trim();
+  if (!trimmed.startsWith("(") || !trimmed.endsWith(")")) return expression;
+
+  let depth = 0;
+  for (let index = 0; index < trimmed.length; index++) {
+    if (trimmed[index] === "(") depth++;
+    else if (trimmed[index] === ")") depth--;
+    if (depth === 0 && index < trimmed.length - 1) return expression;
+  }
+
+  return depth === 0 ? trimmed.slice(1, -1) : expression;
+}
+
 export default class MultiPlotterPlugin extends Plugin {
   blockRegistry: WeakMap<HTMLElement, { skipNextRender: boolean }> = new WeakMap();
   private compiledExpressions = new Map<string, ((scope: Record<string, number>) => unknown) | null>();
+  private implicitMeshCache = new Map<string, Mesh>();
 
   async onload() {
     this.blockRegistry = new WeakMap();
@@ -215,9 +306,9 @@ export default class MultiPlotterPlugin extends Plugin {
     }
     if (parsed.bounds !== undefined) {
       const bounds = parsed.bounds;
-      if (!isFiniteNumberArray(bounds) || ![2, 4].includes(bounds.length) || bounds[0] >= bounds[1] ||
-        (bounds.length === 4 && bounds[2] >= bounds[3])) {
-        throw new Error("'bounds' must contain two or four finite values in ascending order.");
+      if (!isFiniteNumberArray(bounds) || ![2, 4, 6].includes(bounds.length) || bounds[0] >= bounds[1] ||
+        (bounds.length >= 4 && bounds[2] >= bounds[3]) || (bounds.length === 6 && bounds[4] >= bounds[5])) {
+        throw new Error("'bounds' must contain two, four or six finite values in ascending order.");
       }
     }
 
@@ -230,6 +321,10 @@ export default class MultiPlotterPlugin extends Plugin {
         }
       } else if (item.type === "fn") {
         if (typeof item.fn !== "string") throw new Error(`${prefix} must have a string 'fn'.`);
+      } else if (item.type === "implicit") {
+        if (parsed.type === "2d" || typeof item.equation !== "string") {
+          throw new Error(`${prefix} must have a string 'equation' and be used in 3D mode.`);
+        }
       } else if (item.type === "point") {
         if (typeof item.coords !== "string") throw new Error(`${prefix} must have string 'coords'.`);
       } else if (item.type === "vector") {
@@ -252,32 +347,40 @@ export default class MultiPlotterPlugin extends Plugin {
       { trigger: "inf", replace: "\\infty " },
       { trigger: "sq", replace: "\\sqrt{}" },
       { trigger: "fr", replace: "\\frac{}{}" },
+      { trigger: "max", replace: "\\max{}" },
+      { trigger: "min", replace: "\\min{}" },
+      { trigger: "abs", replace: "||" },
       { trigger: "sin", replace: "\\sin(" },
       { trigger: "cos", replace: "\\cos(" },
       { trigger: "tan", replace: "\\tan(" },
       { trigger: "exp", replace: "\\exp(" }
     ];
 
-    inputEl.addEventListener("input", () => {
+    inputEl.addEventListener("input", (event: Event) => {
       const cursor = inputEl.selectionStart;
       const text = inputEl.value;
 
-      for (let i = 0; i < snippets.length; i++) {
-        const s = snippets[i];
-        const len = s.trigger.length;
-        if (cursor >= len && text.slice(cursor - len, cursor) === s.trigger) {
-          const before = text.slice(0, cursor - len);
-          const after = text.slice(cursor);
-          inputEl.value = before + s.replace + after;
+      if (event instanceof InputEvent && event.inputType === "insertText" && cursor !== null) {
+        for (let i = 0; i < snippets.length; i++) {
+          const s = snippets[i];
+          const len = s.trigger.length;
+          if (cursor >= len && text.slice(cursor - len, cursor) === s.trigger) {
+            const before = text.slice(0, cursor - len);
+            if (/[a-zA-Z\\]$/.test(before)) continue;
+            const after = text.slice(cursor);
+            inputEl.value = before + s.replace + after;
 
-          let newPos = before.length + s.replace.length;
-          if (s.replace.indexOf("{}") !== -1) {
-            newPos = before.length + s.replace.indexOf("{}") + 1;
-          } else if (s.replace.endsWith("(")) {
-            newPos = before.length + s.replace.length;
+            let newPos = before.length + s.replace.length;
+            if (s.replace.indexOf("{}") !== -1) {
+              newPos = before.length + s.replace.indexOf("{}") + 1;
+            } else if (s.replace === "||") {
+              newPos = before.length + 1;
+            } else if (s.replace.endsWith("(")) {
+              newPos = before.length + s.replace.length;
+            }
+            inputEl.setSelectionRange(newPos, newPos);
+            break;
           }
-          inputEl.setSelectionRange(newPos, newPos);
-          break;
         }
       }
       onUpdate();
@@ -287,22 +390,70 @@ export default class MultiPlotterPlugin extends Plugin {
   latexToJS(latex: string, vars: Record<string, number> = {}): (x: number, y: number) => number | null {
     const source = (latex || "").trim();
     if (!source) return () => null;
+    const expression = source.replace(/^(z|y|f\([xXyY,\s]+\))\s*=\s*/i, "");
+    const evaluate = this.compileMathExpression(expression, vars, ["x", "y"]);
+    if (!evaluate) return () => null;
+    return (x: number, y: number) => {
+      try {
+        const value = evaluate({ ...vars, x, y });
+        return typeof value === "number" && Number.isFinite(value) ? value : null;
+      } catch {
+        return null;
+      }
+    };
+  }
 
-    const cacheKey = `${source}\u0000${Object.keys(vars).sort().join(",")}`;
+  latexToImplicit(equation: string, vars: Record<string, number> = {}): ((x: number, y: number, z: number) => number | null) | null {
+    const source = (equation || "").trim();
+    const equalsIndex = source.indexOf("=");
+    if (equalsIndex <= 0 || equalsIndex !== source.lastIndexOf("=")) return null;
+
+    const left = source.slice(0, equalsIndex).trim();
+    const right = source.slice(equalsIndex + 1).trim();
+    if (!left || !right) return null;
+    const evaluate = this.compileMathExpression(`(${left}) - (${right})`, vars, ["x", "y", "z"]);
+    if (!evaluate) return null;
+    const scope = { ...vars, x: 0, y: 0, z: 0 };
+
+    return (x: number, y: number, z: number) => {
+      try {
+        scope.x = x;
+        scope.y = y;
+        scope.z = z;
+        const value = evaluate(scope);
+        return typeof value === "number" && Number.isFinite(value) ? value : null;
+      } catch {
+        return null;
+      }
+    };
+  }
+
+  private compileMathExpression(
+    source: string,
+    vars: Record<string, number>,
+    coordinates: string[]
+  ): ((scope: Record<string, number>) => unknown) | null {
+    if (!source) return null;
+    if (/(^|[^\\])\b(?:abs|acos|asin|atan|ceil|cos|cosh|exp|floor|log|max|min|pow|round|sign|sin|sinh|sqrt|tan|tanh)\s*(?:\(|\{)/.test(source)) {
+      return null;
+    }
+
+    const cacheKey = `${source}\u0000${Object.keys(vars).sort().join(",")}\u0000${coordinates.join(",")}`;
     let evaluate = this.compiledExpressions.get(cacheKey);
     if (evaluate === undefined) {
-      let expr = source.replace(/^(z|y|f\([xXyY,\s]+\))\s*=\s*/i, "");
-      while (/\\sqrt\{([^}]+)\}/.test(expr)) {
-        expr = expr.replace(/\\sqrt\{([^}]+)\}/g, "sqrt(($1))");
-      }
+      let expr = replaceLatexCommandGroups(source, "sqrt", 1, args => `sqrt((${args[0]}))`);
       expr = expr.replace(/\\sqrt\s*([a-zA-Z0-9])/g, "sqrt($1)");
+      expr = replaceLatexCommandGroups(expr, "frac", 2, args => `((${args[0]})/(${args[1]}))`);
+      expr = replaceLatexCommandGroups(expr, "max", 1, args => `max(${unwrapOuterParentheses(args[0])})`);
+      expr = replaceLatexCommandGroups(expr, "min", 1, args => `min(${unwrapOuterParentheses(args[0])})`);
 
-      while (/\\frac\{([^}]+)\}\{([^}]+)\}/.test(expr)) {
-        expr = expr.replace(/\\frac\{([^}]+)\}\{([^}]+)\}/g, "(($1)/($2))");
+      while (/\|([^|]+)\|/.test(expr)) {
+        expr = expr.replace(/\|([^|]+)\|/g, "abs($1)");
       }
 
       expr = expr.replace(/\\ln\b/g, "log");
-      expr = expr.replace(/\\(sin|cos|tan|asin|acos|atan|sinh|cosh|tanh|exp|log|abs)/g, "$1");
+      expr = expr.replace(/\\(arcsin|arccos|arctan)\b/g, (_match, name: string) => name.slice(3));
+      expr = expr.replace(/\\(sin|cos|tan|asin|acos|atan|sinh|cosh|tanh|exp|log|max|min|ceil|floor|pow|round|sign)\b/g, "$1");
       expr = expr.replace(/\\cdot|\\times/g, "*");
       expr = expr.replace(/\\pi/g, "pi");
       expr = expr.replace(/\\left|\\right/g, "");
@@ -313,9 +464,8 @@ export default class MultiPlotterPlugin extends Plugin {
 
       try {
         const node = parse(expr);
-        const allowedSymbols = new Set(["e", "pi", "x", "y", ...Object.keys(vars), ...ALLOWED_MATH_FUNCTIONS]);
+        const allowedSymbols = new Set(["e", "pi", ...coordinates, ...Object.keys(vars), ...ALLOWED_MATH_FUNCTIONS]);
         let isSafe = true;
-
         node.traverse((child) => {
           const childNode = child as { type: string; name?: string; op?: string };
           if (childNode.type === "ConstantNode" || childNode.type === "ParenthesisNode") return;
@@ -350,16 +500,7 @@ export default class MultiPlotterPlugin extends Plugin {
         if (oldestKey !== undefined) this.compiledExpressions.delete(oldestKey);
       }
     }
-
-    if (!evaluate) return () => null;
-    return (x: number, y: number) => {
-      try {
-        const value = evaluate({ ...vars, x, y });
-        return typeof value === "number" && Number.isFinite(value) ? value : null;
-      } catch {
-        return null;
-      }
-    };
+    return evaluate;
   }
 
   evalVectorExpr(exprStr: string, vars: Record<string, number> = {}): number[] {
@@ -386,6 +527,7 @@ export default class MultiPlotterPlugin extends Plugin {
     const toolbar = wrapper.createDiv({ cls: "math-toolbar" });
 
     const addBtn = toolbar.createEl("button", { text: "+ Equation" });
+    const addImplicitBtn = toolbar.createEl("button", { text: "+ Implicit" });
     const addPtBtn = toolbar.createEl("button", { text: "+ Point" });
     const addVecBtn = toolbar.createEl("button", { text: "+ Vector" });
 
@@ -419,7 +561,7 @@ export default class MultiPlotterPlugin extends Plugin {
 
     const defaultAxes = { x: true, y: true, z: true };
     const initialCam = initialConfig.camera || {};
-    
+
     const defaultCam = {
       rotX: 1.05,
       rotZ: -1.95,
@@ -446,6 +588,7 @@ export default class MultiPlotterPlugin extends Plugin {
       panY: initialCam.panY !== undefined ? initialCam.panY : defaultCam.panY,
       locked: false
     };
+    addImplicitBtn.disabled = state.type !== "3d";
 
     const tracker = { skipNextRender: false };
     this.blockRegistry.set(rootEl, tracker);
@@ -594,6 +737,15 @@ export default class MultiPlotterPlugin extends Plugin {
             max: r.max,
             step: r.step
           };
+        } else if (r.type === "implicit") {
+          return {
+            type: "implicit",
+            equation: r.input ? r.input.value.trim() : "",
+            color: r.color || palette[0],
+            opacity: r.opacity !== undefined ? r.opacity : 1.0,
+            label: r.labelInput ? r.labelInput.value.trim() : "",
+            visible: r.visible !== undefined ? r.visible : true
+          };
         } else if (r.type === "point") {
           return {
             type: "point",
@@ -623,6 +775,7 @@ export default class MultiPlotterPlugin extends Plugin {
         }
       }).filter(item => {
         if (item.type === "var") return true;
+        if (item.type === "implicit") return item.equation.length > 0;
         if (item.type === "point") return item.coords.length > 0;
         if (item.type === "vector") return item.origin.length > 0;
         return item.fn && item.fn.length > 0;
@@ -656,6 +809,10 @@ export default class MultiPlotterPlugin extends Plugin {
       saveTimer = window.setTimeout(async () => {
         try {
           if (lifecycleController.signal.aborted) return;
+          if (document.activeElement instanceof HTMLInputElement && wrapper.contains(document.activeElement)) {
+            saveTimer = window.setTimeout(debouncedSave, 1500);
+            return;
+          }
           const file = this.app.vault.getAbstractFileByPath(ctx.sourcePath);
           if (!(file instanceof TFile)) return;
 
@@ -705,6 +862,7 @@ export default class MultiPlotterPlugin extends Plugin {
     typeSelect.addEventListener("change", (e) => {
       state.type = (e.target as HTMLSelectElement).value as MathPlotConfig["type"];
       state.bounds = state.type === "2d" ? [-8, 8] : [-4, 4, -4, 4];
+      addImplicitBtn.disabled = state.type !== "3d";
       zWrap.classList.toggle("math-hidden", state.type !== "3d");
       this.drawCanvas(canvas, state);
       debouncedSave();
@@ -1010,14 +1168,18 @@ export default class MultiPlotterPlugin extends Plugin {
         return;
       }
 
-      const prefix = state.type === "3d" ? "z = " : "y = ";
+      if (itemRef.type === "implicit") {
+        bodyContainer.createSpan({ text: "F=0:", cls: "math-item-type-badge" });
+      }
+
+      const prefix = itemRef.type === "implicit" ? "" : state.type === "3d" ? "z = " : "y = ";
 
       const input = bodyContainer.createEl("input", {
         type: "text",
-        placeholder: state.type === "3d" ? "\\sqrt{x^2+y^2} or a = 2" : "\\sin(x) or a = 2",
+        placeholder: itemRef.type === "implicit" ? "x^2 + y^2 + z^2 = 1" : state.type === "3d" ? "\\sqrt{x^2+y^2} or a = 2" : "\\sin(x) or a = 2",
         cls: "math-equation-input"
       });
-      input.value = (itemData && itemData.fn) || "";
+      input.value = (itemData && (itemRef.type === "implicit" ? itemData.equation : itemData.fn)) || "";
 
       row.classList.add("math-equation-row");
       const previewEl = bodyContainer.createDiv({ cls: "math-equation-preview" });
@@ -1037,6 +1199,7 @@ export default class MultiPlotterPlugin extends Plugin {
       previewEl.addEventListener("click", () => setMode(true));
 
       const testAndTransformSlider = (): boolean => {
+        if (itemRef.type === "implicit") return false;
         if (transformedToSlider) return true;
         const txt = input.value.trim();
         const match = txt.match(/^([a-zA-Z][a-zA-Z0-9_]*)\s*=\s*(-?\d*\.?\d+)$/);
@@ -1085,6 +1248,12 @@ export default class MultiPlotterPlugin extends Plugin {
 
     addBtn.addEventListener("click", () => {
       createRow(null, "fn", true);
+      this.drawCanvas(canvas, state);
+      debouncedSave();
+    });
+
+    addImplicitBtn.addEventListener("click", () => {
+      createRow({ type: "implicit", equation: "x^2 + y^2 + z^2 = 1" }, "implicit", true);
       this.drawCanvas(canvas, state);
       debouncedSave();
     });
@@ -1225,15 +1394,6 @@ export default class MultiPlotterPlugin extends Plugin {
       return `rgba(${r}, ${g}, ${b}, ${alpha})`;
     };
 
-    const shadeRgba = (hex: string, percent: number, alpha = 1.0): string => {
-      let num = parseInt((hex || "#4caf50").replace("#", ""), 16);
-      if (isNaN(num)) return `rgba(76, 175, 80, ${alpha})`;
-      let r = Math.max(0, Math.min(255, ((num >> 16) & 255) + percent));
-      let g = Math.max(0, Math.min(255, ((num >> 8) & 255) + percent));
-      let b = Math.max(0, Math.min(255, (num & 255) + percent));
-      return `rgba(${r}, ${g}, ${b}, ${alpha})`;
-    };
-
     const queueLabel = (text: string, px: number, py: number, color = "#ffffff"): void => {
       if (!text) return;
       labelsToDraw.push({ text, px, py, color });
@@ -1337,7 +1497,7 @@ export default class MultiPlotterPlugin extends Plugin {
       }
 
       state.rows.forEach(r => {
-        if (!r.input || r.visible === false) return;
+        if (!r.input || r.visible === false || r.type === "implicit") return;
         const col = r.color || "#4caf50";
         const label = r.labelInput ? r.labelInput.value.trim() : "";
 
@@ -1551,6 +1711,7 @@ export default class MultiPlotterPlugin extends Plugin {
       const stepY = (yMax - yMin) / steps;
 
       const activeFns: ActiveFunction[] = [];
+      const implicitSurfaces: RenderedImplicitSurface[] = [];
 
       state.rows.forEach(r => {
         if (!r.input || r.visible === false) return;
@@ -1624,6 +1785,50 @@ export default class MultiPlotterPlugin extends Plugin {
 
         const val = r.input.value.trim();
         if (!val) return;
+        const isImplicitEquation = r.type === "implicit" ||
+          (r.type === "fn" && val.includes("=") && /[zZ]/.test(val) && !/^\s*z\s*=/i.test(val));
+        if (isImplicitEquation) {
+          const field = this.latexToImplicit(val, currentVars);
+          if (!field) return;
+
+          const zMin = bounds.length >= 6 ? bounds[4] : -4;
+          const zMax = bounds.length >= 6 ? bounds[5] : 4;
+          const meshResolution = Math.max(24, Math.min(40, steps));
+          const variableKey = Object.keys(currentVars).sort().map(name => [name, currentVars[name]]);
+          const cacheKey = JSON.stringify([val, variableKey, xMin, xMax, yMin, yMax, zMin, zMax, meshResolution]);
+          let mesh = this.implicitMeshCache.get(cacheKey);
+          if (!mesh) {
+            try {
+              mesh = surfaceNets(
+                [meshResolution, meshResolution, meshResolution],
+                (x, y, z) => field(x, y, z) ?? 1e6,
+                [[xMin, yMin, zMin], [xMax, yMax, zMax]]
+              );
+            } catch {
+              return;
+            }
+            this.implicitMeshCache.set(cacheKey, mesh);
+            if (this.implicitMeshCache.size > 12) {
+              const oldestKey = this.implicitMeshCache.keys().next().value as string | undefined;
+              if (oldestKey !== undefined) this.implicitMeshCache.delete(oldestKey);
+            }
+          }
+
+          const points = mesh.positions.map(vertex => project(vertex[0], vertex[1], vertex[2]));
+          implicitSurfaces.push({
+            points,
+            cells: mesh.cells,
+            color: col,
+            opacity: r.opacity !== undefined ? r.opacity : 1,
+            label
+          });
+          if (label && points.length > 0) {
+            const center = points.reduce((sum, point) => ({ px: sum.px + point.px, py: sum.py + point.py }), { px: 0, py: 0 });
+            queueLabel(label, center.px / points.length, center.py / points.length, col);
+          }
+          return;
+        }
+
         const fn = this.latexToJS(val, currentVars);
         const op = r.opacity !== undefined ? r.opacity : 1.0;
 
@@ -1643,59 +1848,125 @@ export default class MultiPlotterPlugin extends Plugin {
       });
 
       if (state.renderStyle === "solid") {
-        const polygons: SurfacePolygon[] = [];
+        const rasterScale = Math.max(1, Math.min(Math.max(2, dpr), Math.sqrt(4000000 / (w * h))));
+        const rasterWidth = Math.ceil(w * rasterScale);
+        const rasterHeight = Math.ceil(h * rasterScale);
+        const pixelCount = rasterWidth * rasterHeight;
+        const surfaceCanvas = document.createElement("canvas");
+        surfaceCanvas.width = rasterWidth;
+        surfaceCanvas.height = rasterHeight;
+        const surfaceCtx = surfaceCanvas.getContext("2d");
+        if (!surfaceCtx) return;
+
+        const surfaceImage = surfaceCtx.createImageData(rasterWidth, rasterHeight);
+        const depthBuffer = new Float32Array(pixelCount);
+        depthBuffer.fill(Number.NEGATIVE_INFINITY);
+        const surfacePixels = surfaceImage.data;
+
+        const rasterizeTriangle = (
+          point0: ProjectedPoint,
+          point1: ProjectedPoint,
+          point2: ProjectedPoint,
+          red: number,
+          green: number,
+          blue: number,
+          alpha: number
+        ): void => {
+          const x0 = point0.px * rasterScale;
+          const y0 = point0.py * rasterScale;
+          const x1 = point1.px * rasterScale;
+          const y1 = point1.py * rasterScale;
+          const x2 = point2.px * rasterScale;
+          const y2 = point2.py * rasterScale;
+          const denominator = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2);
+          if (Math.abs(denominator) < 1e-8 || alpha <= 0) return;
+
+          const minX = Math.max(0, Math.floor(Math.min(x0, x1, x2)));
+          const maxX = Math.min(rasterWidth - 1, Math.ceil(Math.max(x0, x1, x2)));
+          const minY = Math.max(0, Math.floor(Math.min(y0, y1, y2)));
+          const maxY = Math.min(rasterHeight - 1, Math.ceil(Math.max(y0, y1, y2)));
+
+          for (let py = minY; py <= maxY; py++) {
+            for (let px = minX; px <= maxX; px++) {
+              const sampleX = px + 0.5;
+              const sampleY = py + 0.5;
+              const weight0 = ((y1 - y2) * (sampleX - x2) + (x2 - x1) * (sampleY - y2)) / denominator;
+              const weight1 = ((y2 - y0) * (sampleX - x2) + (x0 - x2) * (sampleY - y2)) / denominator;
+              const weight2 = 1 - weight0 - weight1;
+              if (weight0 < 0 || weight1 < 0 || weight2 < 0) continue;
+
+              const depth = weight0 * point0.depth + weight1 * point1.depth + weight2 * point2.depth;
+              const pixelIndex = py * rasterWidth + px;
+              if (depth <= depthBuffer[pixelIndex]) continue;
+
+              depthBuffer[pixelIndex] = depth;
+              const colorIndex = pixelIndex * 4;
+              surfacePixels[colorIndex] = red;
+              surfacePixels[colorIndex + 1] = green;
+              surfacePixels[colorIndex + 2] = blue;
+              surfacePixels[colorIndex + 3] = alpha;
+            }
+          }
+        };
 
         activeFns.forEach(({ col, op, gridZ }) => {
+          const colorNumber = parseInt((col || "#4caf50").replace("#", ""), 16);
+          const baseRed = Number.isNaN(colorNumber) ? 76 : (colorNumber >> 16) & 255;
+          const baseGreen = Number.isNaN(colorNumber) ? 175 : (colorNumber >> 8) & 255;
+          const baseBlue = Number.isNaN(colorNumber) ? 80 : colorNumber & 255;
+          const alpha = Math.round(Math.max(0, Math.min(1, op * 0.85)) * 255);
+
           for (let j = 0; j < steps; j++) {
             for (let i = 0; i < steps; i++) {
               const z00 = gridZ[j][i];
               const z10 = gridZ[j][i + 1];
               const z11 = gridZ[j + 1][i + 1];
               const z01 = gridZ[j + 1][i];
+              if (z00 === null || z10 === null || z11 === null || z01 === null) continue;
 
-              if (z00 !== null && z10 !== null && z11 !== null && z01 !== null) {
-                const x0 = xMin + i * stepX;
-                const x1 = xMin + (i + 1) * stepX;
-                const y0 = yMin + j * stepY;
-                const y1 = yMin + (j + 1) * stepY;
+              const x0 = xMin + i * stepX;
+              const x1 = xMin + (i + 1) * stepX;
+              const y0 = yMin + j * stepY;
+              const y1 = yMin + (j + 1) * stepY;
+              const p00 = project(x0, y0, z00);
+              const p10 = project(x1, y0, z10);
+              const p11 = project(x1, y1, z11);
+              const p01 = project(x0, y1, z01);
+              const shade = Math.round(Math.max(-40, Math.min(40, (z11 - z00) * 15)));
+              const red = Math.max(0, Math.min(255, baseRed + shade));
+              const green = Math.max(0, Math.min(255, baseGreen + shade));
+              const blue = Math.max(0, Math.min(255, baseBlue + shade));
 
-                const p00 = project(x0, y0, z00);
-                const p10 = project(x1, y0, z10);
-                const p11 = project(x1, y1, z11);
-                const p01 = project(x0, y1, z01);
-
-                const slope = (z11 - z00);
-                const shade = Math.round(Math.max(-40, Math.min(40, slope * 15)));
-                const avgDepth = (p00.depth + p10.depth + p11.depth + p01.depth) / 4;
-
-                polygons.push({
-                  pts: [p00, p10, p11, p01],
-                  color: shadeRgba(col, shade, op * 0.85),
-                  edgeColor: shadeRgba(col, -30, op * 0.4),
-                  depth: avgDepth
-                });
-              }
+              rasterizeTriangle(p00, p10, p11, red, green, blue, alpha);
+              rasterizeTriangle(p00, p11, p01, red, green, blue, alpha);
             }
           }
         });
 
-        polygons.sort((a, b) => a.depth - b.depth);
+        implicitSurfaces.forEach(surface => {
+          const colorNumber = parseInt(surface.color.replace("#", ""), 16);
+          const red = Number.isNaN(colorNumber) ? 76 : (colorNumber >> 16) & 255;
+          const green = Number.isNaN(colorNumber) ? 175 : (colorNumber >> 8) & 255;
+          const blue = Number.isNaN(colorNumber) ? 80 : colorNumber & 255;
+          const alpha = Math.round(Math.max(0, Math.min(1, surface.opacity * 0.85)) * 255);
 
-        polygons.forEach(p => {
-          ctx.beginPath();
-          ctx.moveTo(p.pts[0].px, p.pts[0].py);
-          ctx.lineTo(p.pts[1].px, p.pts[1].py);
-          ctx.lineTo(p.pts[2].px, p.pts[2].py);
-          ctx.lineTo(p.pts[3].px, p.pts[3].py);
-          ctx.closePath();
-
-          ctx.fillStyle = p.color;
-          ctx.fill();
-
-          ctx.strokeStyle = p.edgeColor;
-          ctx.lineWidth = 0.5;
-          ctx.stroke();
+          surface.cells.forEach(cell => {
+            if (cell.length < 3) return;
+            const point0 = surface.points[cell[0]];
+            for (let index = 1; index < cell.length - 1; index++) {
+              const point1 = surface.points[cell[index]];
+              const point2 = surface.points[cell[index + 1]];
+              if (point0 && point1 && point2) {
+                rasterizeTriangle(point0, point1, point2, red, green, blue, alpha);
+              }
+            }
+          });
         });
+
+        surfaceCtx.putImageData(surfaceImage, 0, 0);
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = "high";
+        ctx.drawImage(surfaceCanvas, 0, 0, rasterWidth, rasterHeight, 0, 0, w, h);
 
       } else if (state.renderStyle === "points") {
         activeFns.forEach(({ col, op, gridZ }) => {
@@ -1713,6 +1984,15 @@ export default class MultiPlotterPlugin extends Plugin {
               }
             }
           }
+        });
+
+        implicitSurfaces.forEach(surface => {
+          ctx.fillStyle = hexToRgba(surface.color, surface.opacity);
+          surface.points.forEach(point => {
+            ctx.beginPath();
+            ctx.arc(point.px, point.py, 1.8, 0, Math.PI * 2);
+            ctx.fill();
+          });
         });
 
       } else {
@@ -1761,6 +2041,33 @@ export default class MultiPlotterPlugin extends Plugin {
             const pMid = project(0, 0, midZ);
             queueLabel(label, pMid.px, pMid.py, col);
           }
+        });
+      }
+
+      if (state.renderStyle === "wireframe") {
+        implicitSurfaces.forEach(surface => {
+          ctx.strokeStyle = hexToRgba(surface.color, surface.opacity);
+          ctx.lineWidth = 0.8;
+          ctx.beginPath();
+          const drawnEdges = new Set<string>();
+
+          surface.cells.forEach(cell => {
+            for (let index = 0; index < cell.length; index++) {
+              const startIndex = cell[index];
+              const endIndex = cell[(index + 1) % cell.length];
+              const edgeKey = startIndex < endIndex ? `${startIndex}:${endIndex}` : `${endIndex}:${startIndex}`;
+              if (drawnEdges.has(edgeKey)) continue;
+              drawnEdges.add(edgeKey);
+
+              const start = surface.points[startIndex];
+              const end = surface.points[endIndex];
+              if (!start || !end) continue;
+              ctx.moveTo(start.px, start.py);
+              ctx.lineTo(end.px, end.py);
+            }
+          });
+
+          ctx.stroke();
         });
       }
 

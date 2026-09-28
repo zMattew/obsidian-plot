@@ -61,7 +61,24 @@ Run **Create new graph (Modal UI)** from the Command palette, or add a `math-plo
 
 Use `"type": "2d"` for a 2D graph. In 3D, `bounds` is `[xMin, xMax, yMin, yMax]`; in 2D, it is `[xMin, xMax]`. Point coordinates and vector origins/directions are comma-separated expressions and can use declared variables.
 
-Supported expressions include arithmetic, powers, implicit multiplication, constants `pi` and `e`, and functions such as `sin`, `cos`, `tan`, `sqrt`, `abs`, `exp`, and `log`. LaTeX forms such as `\\sqrt{x^2 + y^2}`, `\\frac{1}{2}`, and `\\sin(x)` are also supported.
+Supported expressions include arithmetic, powers, implicit multiplication, and constants `pi` and `e`. Function calls use LaTeX commands such as `\\sqrt{x}`, `\\sin(x)`, and `\\max{(a,b)}`; absolute values use `|x|`. Raw calls such as `max(x, y)` and `abs(x)` are not accepted.
+
+Implicit 3D surfaces use an `implicit` item with an equation `F(x,y,z)=0`. Existing `fn` items containing a `z`-dependent equality are detected automatically too. Six-value 3D bounds optionally set the x, y, and z intervals:
+
+```json
+{
+  "type": "3d",
+  "renderStyle": "solid",
+  "bounds": [-2, 2, -2, 2, -2, 2],
+  "items": [
+    {
+      "type": "implicit",
+      "equation": "x^2 + y^2 + z^2 + x + y + z = 0",
+      "color": "#f59e0b"
+    }
+  ]
+}
+```
 
 ## Development
 
