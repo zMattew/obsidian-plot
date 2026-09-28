@@ -849,10 +849,14 @@ export default class MultiPlotterPlugin extends Plugin {
 
       colorBadge.addEventListener("click", (e) => {
         e.stopPropagation();
-        colorPopover.classList.toggle("is-open");
+        const isOpen = colorPopover.classList.toggle("is-open");
+        row.classList.toggle("is-color-picker-open", isOpen);
       });
       colorPopover.addEventListener("click", (e) => e.stopPropagation());
-      document.addEventListener("click", () => colorPopover.classList.remove("is-open"), { signal: lifecycleController.signal });
+      document.addEventListener("click", () => {
+        colorPopover.classList.remove("is-open");
+        row.classList.remove("is-color-picker-open");
+      }, { signal: lifecycleController.signal });
 
       const bodyContainer = row.createDiv({ cls: "math-row-body" });
 

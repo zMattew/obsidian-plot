@@ -158,6 +158,12 @@
   overflow: hidden;
 }
 
+.math-row.is-color-picker-open {
+  position: relative;
+  z-index: 1;
+  overflow: visible;
+}
+
 .math-row-drag-handle {
   cursor: grab;
   color: var(--text-muted);
