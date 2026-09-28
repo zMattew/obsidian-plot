@@ -22,9 +22,19 @@ const buildOptions = {
   outfile: `${outputDirectory}/main.js`
 };
 
+const workerBuildOptions = {
+  entryPoints: ["plot-worker.ts"],
+  bundle: true,
+  platform: "browser",
+  target: "es2020",
+  format: "iife",
+  minify: !watch,
+  outfile: `${outputDirectory}/plot-worker.js`
+};
+
 if (watch) {
-  const buildContext = await context(buildOptions);
-  await buildContext.watch();
+  const buildContexts = await Promise.all([context(buildOptions), context(workerBuildOptions)]);
+  await Promise.all(buildContexts.map(buildContext => buildContext.watch()));
 } else {
-  await build(buildOptions);
+  await Promise.all([build(buildOptions), build(workerBuildOptions)]);
 }

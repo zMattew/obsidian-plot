@@ -5,6 +5,7 @@ Plot is an Obsidian plugin for creating interactive 2D graphs and 3D surfaces di
 ## Features
 
 - Plot equations as 2D curves or 3D surfaces.
+- Render 3D scenes with WebGL; generate meshes in a background worker, with Canvas2D fallback.
 - Choose wireframe, solid-surface, or point-cloud rendering.
 - Add points, vectors, and adjustable variables.
 - Change the camera, axes, grid, resolution, and intersection display.
@@ -13,7 +14,7 @@ Plot is an Obsidian plugin for creating interactive 2D graphs and 3D surfaces di
 
 ## Install
 
-Download `main.js`, `manifest.json`, and `styles.css` from a release and place them in your vault at:
+Download `main.js`, `plot-worker.js`, `manifest.json`, and `styles.css` from a release and place them in your vault at:
 
 ```text
 <Vault>/.obsidian/plugins/plot/
@@ -93,6 +94,12 @@ The development build watches for changes. To create a production build in `dist
 
 ```sh
 npm run build
+```
+
+To build the plugin and run the mesh-worker tests, run:
+
+```sh
+npm run test:worker
 ```
 
 ## License

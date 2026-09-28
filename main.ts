@@ -1,6 +1,9 @@
-import { parse } from "mathjs";
 import { App, finishRenderMath, MarkdownPostProcessorContext, MarkdownRenderChild, Modal, Plugin, renderMath, TFile } from "obsidian";
 import type { AxesVisibility, MathPlotConfig, PlotItem } from "./types";
+import { ALLOWED_MATH_FUNCTIONS, MathExpressionCompiler } from "./math-expression";
+import { expandImplicitBounds } from "./implicit-bounds";
+import { WebGLPlotRenderer, type WebGLOverlayItem, type WebGLViewState } from "./webgl-renderer";
+import type { MeshRequest, MeshRequestItem, MeshResponse, PlotBounds3D, RenderedMeshData } from "./plot-protocol";
 
 declare const require: (moduleName: string) => unknown;
 
@@ -75,6 +78,14 @@ interface PlotUIState {
   panX: number;
   panY: number;
   locked: boolean;
+  webglRenderer: WebGLPlotRenderer | null;
+  meshWorker: Worker | null;
+  meshRequestId: number;
+  meshRequestSignature: string;
+  webglMeshes: RenderedMeshData[];
+    webglIntersections: ArrayBuffer;
+  webglBounds: PlotBounds3D;
+  webglRenderStyle: PlotUIState["renderStyle"] | null;
 }
 
 interface ProjectedPoint {
@@ -99,11 +110,6 @@ interface RenderedImplicitSurface {
   label: string;
 }
 
-const ALLOWED_MATH_FUNCTIONS = new Set([
-  "abs", "acos", "asin", "atan", "ceil", "cos", "cosh", "exp", "floor", "log", "max", "min",
-  "pow", "round", "sign", "sin", "sinh", "sqrt", "tan", "tanh"
-]);
-const ALLOWED_MATH_OPERATORS = new Set(["+", "-", "*", "/", "%", "^"]);
 const RESERVED_VARIABLE_NAMES = new Set(["x", "y", "z", "e", "pi"]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -129,141 +135,9 @@ function isValidVariableName(name: string): boolean {
     !ALLOWED_MATH_FUNCTIONS.has(normalizedName);
 }
 
-function replaceLatexCommandGroups(
-  expression: string,
-  command: string,
-  argumentCount: number,
-  convert: (args: string[]) => string
-): string {
-  const token = `\\${command}`;
-  let result = "";
-  let index = 0;
-
-  while (index < expression.length) {
-    const commandIndex = expression.indexOf(token, index);
-    if (commandIndex === -1) return result + expression.slice(index);
-
-    result += expression.slice(index, commandIndex);
-    let cursor = commandIndex + token.length;
-    if (/[a-zA-Z]/.test(expression[cursor] || "")) {
-      result += token;
-      index = cursor;
-      continue;
-    }
-
-    const args: string[] = [];
-    let matched = true;
-    for (let argIndex = 0; argIndex < argumentCount; argIndex++) {
-      while (/\s/.test(expression[cursor] || "")) cursor++;
-      if (expression[cursor] !== "{") {
-        matched = false;
-        break;
-      }
-
-      const start = ++cursor;
-      let depth = 1;
-      while (cursor < expression.length && depth > 0) {
-        if (expression[cursor] === "{") depth++;
-        else if (expression[cursor] === "}") depth--;
-        cursor++;
-      }
-      if (depth !== 0) {
-        matched = false;
-        break;
-      }
-      args.push(expression.slice(start, cursor - 1));
-    }
-
-    if (matched) {
-      result += convert(args);
-      index = cursor;
-    } else {
-      result += token;
-      index = commandIndex + token.length;
-    }
-  }
-
-  return result;
-}
-
-function unwrapOuterParentheses(expression: string): string {
-  const trimmed = expression.trim();
-  if (!trimmed.startsWith("(") || !trimmed.endsWith(")")) return expression;
-
-  let depth = 0;
-  for (let index = 0; index < trimmed.length; index++) {
-    if (trimmed[index] === "(") depth++;
-    else if (trimmed[index] === ")") depth--;
-    if (depth === 0 && index < trimmed.length - 1) return expression;
-  }
-
-  return depth === 0 ? trimmed.slice(1, -1) : expression;
-}
-
-type ImplicitBounds = [number, number, number, number, number, number];
-
-function expandImplicitBounds(
-  field: (x: number, y: number, z: number) => number | null,
-  initialBounds: ImplicitBounds
-): ImplicitBounds {
-  const bounds = initialBounds.slice() as ImplicitBounds;
-  const faceSamples = 12;
-
-  for (let pass = 0; pass < 5; pass++) {
-    const expandLow = [false, false, false];
-    const expandHigh = [false, false, false];
-
-    for (let axis = 0; axis < 3; axis++) {
-      for (const highSide of [false, true]) {
-        const faceCoordinate = bounds[axis * 2 + (highSide ? 1 : 0)];
-        let minValue = Number.POSITIVE_INFINITY;
-        let maxValue = Number.NEGATIVE_INFINITY;
-
-        for (let u = 0; u <= faceSamples; u++) {
-          for (let v = 0; v <= faceSamples; v++) {
-            const coordinates = [0, 0, 0];
-            coordinates[axis] = faceCoordinate;
-            let otherAxis = 0;
-            for (let coordinateAxis = 0; coordinateAxis < 3; coordinateAxis++) {
-              if (coordinateAxis === axis) continue;
-              const min = bounds[coordinateAxis * 2];
-              const max = bounds[coordinateAxis * 2 + 1];
-              coordinates[coordinateAxis] = otherAxis === 0
-                ? min + (max - min) * u / faceSamples
-                : min + (max - min) * v / faceSamples;
-              otherAxis++;
-            }
-
-            const value = field(coordinates[0], coordinates[1], coordinates[2]);
-            if (value === null) continue;
-            minValue = Math.min(minValue, value);
-            maxValue = Math.max(maxValue, value);
-          }
-        }
-
-        if (minValue <= 0 && maxValue >= 0) {
-          if (highSide) expandHigh[axis] = true;
-          else expandLow[axis] = true;
-        }
-      }
-    }
-
-    if (![...expandLow, ...expandHigh].some(Boolean)) break;
-
-    for (let axis = 0; axis < 3; axis++) {
-      const span = bounds[axis * 2 + 1] - bounds[axis * 2];
-      const margin = Math.max(span * 0.5, 1);
-      if (expandLow[axis]) bounds[axis * 2] -= margin;
-      if (expandHigh[axis]) bounds[axis * 2 + 1] += margin;
-    }
-  }
-
-  return bounds;
-}
-
 export default class MultiPlotterPlugin extends Plugin {
   blockRegistry: WeakMap<HTMLElement, { skipNextRender: boolean }> = new WeakMap();
-  private compiledExpressions = new Map<string, ((scope: Record<string, number>) => unknown) | null>();
+  private expressionCompiler = new MathExpressionCompiler();
   private implicitMeshCache = new Map<string, Mesh>();
 
   async onload() {
@@ -452,7 +326,7 @@ export default class MultiPlotterPlugin extends Plugin {
     const source = (latex || "").trim();
     if (!source) return () => null;
     const expression = source.replace(/^(z|y|f\([xXyY,\s]+\))\s*=\s*/i, "");
-    const evaluate = this.compileMathExpression(expression, vars, ["x", "y"]);
+    const evaluate = this.expressionCompiler.compile(expression, vars, ["x", "y"]);
     if (!evaluate) return () => null;
     return (x: number, y: number) => {
       try {
@@ -472,7 +346,7 @@ export default class MultiPlotterPlugin extends Plugin {
     const left = source.slice(0, equalsIndex).trim();
     const right = source.slice(equalsIndex + 1).trim();
     if (!left || !right) return null;
-    const evaluate = this.compileMathExpression(`(${left}) - (${right})`, vars, ["x", "y", "z"]);
+    const evaluate = this.expressionCompiler.compile(`(${left}) - (${right})`, vars, ["x", "y", "z"]);
     if (!evaluate) return null;
     const scope = { ...vars, x: 0, y: 0, z: 0 };
 
@@ -487,81 +361,6 @@ export default class MultiPlotterPlugin extends Plugin {
         return null;
       }
     };
-  }
-
-  private compileMathExpression(
-    source: string,
-    vars: Record<string, number>,
-    coordinates: string[]
-  ): ((scope: Record<string, number>) => unknown) | null {
-    if (!source) return null;
-    if (/(^|[^\\])\b(?:abs|acos|asin|atan|ceil|cos|cosh|exp|floor|log|max|min|pow|round|sign|sin|sinh|sqrt|tan|tanh)\s*(?:\(|\{)/.test(source)) {
-      return null;
-    }
-
-    const cacheKey = `${source}\u0000${Object.keys(vars).sort().join(",")}\u0000${coordinates.join(",")}`;
-    let evaluate = this.compiledExpressions.get(cacheKey);
-    if (evaluate === undefined) {
-      let expr = replaceLatexCommandGroups(source, "sqrt", 1, args => `sqrt((${args[0]}))`);
-      expr = expr.replace(/\\sqrt\s*([a-zA-Z0-9])/g, "sqrt($1)");
-      expr = replaceLatexCommandGroups(expr, "frac", 2, args => `((${args[0]})/(${args[1]}))`);
-      expr = replaceLatexCommandGroups(expr, "max", 1, args => `max(${unwrapOuterParentheses(args[0])})`);
-      expr = replaceLatexCommandGroups(expr, "min", 1, args => `min(${unwrapOuterParentheses(args[0])})`);
-
-      while (/\|([^|]+)\|/.test(expr)) {
-        expr = expr.replace(/\|([^|]+)\|/g, "abs($1)");
-      }
-
-      expr = expr.replace(/\\ln\b/g, "log");
-      expr = expr.replace(/\\(arcsin|arccos|arctan)\b/g, (_match, name: string) => name.slice(3));
-      expr = expr.replace(/\\(sin|cos|tan|asin|acos|atan|sinh|cosh|tanh|exp|log|max|min|ceil|floor|pow|round|sign)\b/g, "$1");
-      expr = expr.replace(/\\cdot|\\times/g, "*");
-      expr = expr.replace(/\\pi/g, "pi");
-      expr = expr.replace(/\\left|\\right/g, "");
-      expr = expr.replace(/\bMath\.PI\b/gi, "pi").replace(/\bMath\.E\b/g, "e");
-      expr = expr.replace(/\bMath\./g, "");
-      expr = expr.replace(/\{/g, "(").replace(/\}/g, ")");
-      expr = expr.replace(/([xXyY])\s+([xXyY])/g, "$1*$2");
-
-      try {
-        const node = parse(expr);
-        const allowedSymbols = new Set(["e", "pi", ...coordinates, ...Object.keys(vars), ...ALLOWED_MATH_FUNCTIONS]);
-        let isSafe = true;
-        node.traverse((child) => {
-          const childNode = child as { type: string; name?: string; op?: string };
-          if (childNode.type === "ConstantNode" || childNode.type === "ParenthesisNode") return;
-          if (childNode.type === "SymbolNode") {
-            if (!allowedSymbols.has(childNode.name || "")) isSafe = false;
-            return;
-          }
-          if (childNode.type === "OperatorNode") {
-            if (!ALLOWED_MATH_OPERATORS.has(childNode.op || "")) isSafe = false;
-            return;
-          }
-          if (childNode.type === "FunctionNode") {
-            if (!ALLOWED_MATH_FUNCTIONS.has(childNode.name || "")) isSafe = false;
-            return;
-          }
-          isSafe = false;
-        });
-
-        if (isSafe) {
-          const compiled = node.compile();
-          evaluate = (scope) => compiled.evaluate(scope);
-        } else {
-          evaluate = null;
-        }
-      } catch {
-        evaluate = null;
-      }
-
-      this.compiledExpressions.set(cacheKey, evaluate);
-      if (this.compiledExpressions.size > 256) {
-        const oldestKey = this.compiledExpressions.keys().next().value as string | undefined;
-        if (oldestKey !== undefined) this.compiledExpressions.delete(oldestKey);
-      }
-    }
-    return evaluate;
   }
 
   evalVectorExpr(exprStr: string, vars: Record<string, number> = {}): number[] {
@@ -630,6 +429,10 @@ export default class MultiPlotterPlugin extends Plugin {
       panX: -40,
       panY: 20
     };
+    const configuredBounds = Array.isArray(initialConfig.bounds) ? initialConfig.bounds.slice() : [-4, 4, -4, 4];
+    const webglBounds: PlotBounds3D = configuredBounds.length >= 6
+      ? configuredBounds.slice(0, 6) as PlotBounds3D
+      : [configuredBounds[0], configuredBounds[1], configuredBounds[2], configuredBounds[3], -4, 4];
 
     const state: PlotUIState = {
       type: initialConfig.type || "3d",
@@ -640,14 +443,22 @@ export default class MultiPlotterPlugin extends Plugin {
       showAxisNumbers: initialConfig.showAxisNumbers !== undefined ? Boolean(initialConfig.showAxisNumbers) : true,
       axesEnabled: Object.assign({}, defaultAxes, initialConfig.axesEnabled || {}),
       viewOnly: Boolean(initialConfig.viewOnly),
-      bounds: Array.isArray(initialConfig.bounds) ? initialConfig.bounds.slice() : [-4, 4, -4, 4],
+      bounds: configuredBounds,
       rows: [],
       rotX: initialCam.rotX !== undefined ? initialCam.rotX : defaultCam.rotX,
       rotZ: initialCam.rotZ !== undefined ? initialCam.rotZ : defaultCam.rotZ,
       scale: initialCam.scale !== undefined ? initialCam.scale : defaultCam.scale,
       panX: initialCam.panX !== undefined ? initialCam.panX : defaultCam.panX,
       panY: initialCam.panY !== undefined ? initialCam.panY : defaultCam.panY,
-      locked: false
+      locked: false,
+      webglRenderer: null,
+      meshWorker: null,
+      meshRequestId: 0,
+      meshRequestSignature: "",
+      webglMeshes: [],
+      webglIntersections: new ArrayBuffer(0),
+      webglBounds,
+      webglRenderStyle: null
     };
     addImplicitBtn.disabled = state.type !== "3d";
 
@@ -764,6 +575,78 @@ export default class MultiPlotterPlugin extends Plugin {
     resetViewBtn.title = "Reset View to standard";
 
     const canvas = canvasContainer.createEl("canvas", { cls: "math-canvas" });
+    let webglUnavailable = false;
+
+    const disableWebGL = (): void => {
+      state.meshWorker?.terminate();
+      state.meshWorker = null;
+      state.webglRenderer?.dispose();
+      state.webglRenderer = null;
+      state.webglMeshes = [];
+      state.webglIntersections = new ArrayBuffer(0);
+      state.meshRequestSignature = "";
+      state.webglRenderStyle = null;
+      canvas.style.display = "block";
+      this.drawCanvas(canvas, state);
+    };
+
+    const initializeWebGL = (): void => {
+      if (state.type !== "3d" || webglUnavailable || state.webglRenderer) return;
+      let renderer: WebGLPlotRenderer | null = null;
+      let worker: Worker | null = null;
+      try {
+        const pluginDirectory = this.manifest.dir;
+        if (!pluginDirectory) throw new Error("Plugin directory is not available for the mesh worker.");
+        renderer = new WebGLPlotRenderer(canvasContainer);
+        const workerPath = `${pluginDirectory.replace(/[\\/]+$/, "")}/plot-worker.js`;
+        const adapter = this.app.vault.adapter as typeof this.app.vault.adapter & {
+          getResourcePath?: (normalizedPath: string) => string;
+        };
+        if (!adapter.getResourcePath) throw new Error("This Obsidian version cannot resolve plugin worker assets.");
+        worker = new Worker(adapter.getResourcePath.call(adapter, workerPath));
+
+        state.webglRenderer = renderer;
+        state.meshWorker = worker;
+        state.webglRenderStyle = state.renderStyle;
+        canvas.style.display = "none";
+        renderer.canvas.classList.toggle("is-locked", state.locked);
+        renderer.canvas.addEventListener("webglcontextlost", event => {
+          event.preventDefault();
+          webglUnavailable = true;
+          disableWebGL();
+        }, { once: true });
+
+        worker.onmessage = (event: MessageEvent<MeshResponse>) => {
+          const response = event.data;
+          if (response.requestId !== state.meshRequestId || !state.webglRenderer) return;
+          if (response.error) {
+            console.error("Plot mesh worker error:", response.error);
+            webglUnavailable = true;
+            disableWebGL();
+            return;
+          }
+          state.webglMeshes = response.meshes;
+          state.webglIntersections = response.intersections;
+          state.webglBounds = response.bounds;
+          state.webglRenderStyle = null;
+          this.drawCanvas(canvas, state);
+        };
+        worker.onerror = (event) => {
+          console.error("Plot mesh worker failed:", event.message);
+          webglUnavailable = true;
+          disableWebGL();
+        };
+      } catch (error) {
+        worker?.terminate();
+        renderer?.dispose();
+        webglUnavailable = true;
+        console.warn("WebGL renderer unavailable; using Canvas2D fallback.", error);
+      }
+    };
+
+    initializeWebGL();
+    const resizeObserver = new ResizeObserver(() => this.drawCanvas(canvas, state));
+    resizeObserver.observe(canvasContainer);
 
     lockBtn.addEventListener("click", (e) => {
       e.stopPropagation();
@@ -771,6 +654,7 @@ export default class MultiPlotterPlugin extends Plugin {
       state.locked = !state.locked;
       lockBtn.setText(state.locked ? "🔒" : "🔓");
       canvas.classList.toggle("is-locked", state.locked);
+      state.webglRenderer?.canvas.classList.toggle("is-locked", state.locked);
     });
 
     resetViewBtn.addEventListener("click", (e) => {
@@ -923,8 +807,11 @@ export default class MultiPlotterPlugin extends Plugin {
     typeSelect.addEventListener("change", (e) => {
       state.type = (e.target as HTMLSelectElement).value as MathPlotConfig["type"];
       state.bounds = state.type === "2d" ? [-8, 8] : [-4, 4, -4, 4];
+      state.webglBounds = [-4, 4, -4, 4, -4, 4];
+      state.meshRequestSignature = "";
       addImplicitBtn.disabled = state.type !== "3d";
       zWrap.classList.toggle("math-hidden", state.type !== "3d");
+      initializeWebGL();
       this.drawCanvas(canvas, state);
       debouncedSave();
     });
@@ -1356,7 +1243,11 @@ export default class MultiPlotterPlugin extends Plugin {
       });
     };
 
-    canvas.addEventListener("mousedown", (e) => {
+    const isPlotSurface = (target: EventTarget | null): boolean =>
+      target === canvas || target === state.webglRenderer?.canvas;
+
+    canvasContainer.addEventListener("mousedown", (e) => {
+      if (!isPlotSurface(e.target)) return;
       if (state.locked) return;
       isDragging = true;
       isPanning = Boolean(e.shiftKey || e.button === 1);
@@ -1364,6 +1255,8 @@ export default class MultiPlotterPlugin extends Plugin {
       lastY = e.clientY;
       canvas.classList.toggle("is-panning", isPanning);
       canvas.classList.add("is-dragging");
+      state.webglRenderer?.canvas.classList.toggle("is-panning", isPanning);
+      state.webglRenderer?.canvas.classList.add("is-dragging");
     });
 
     window.addEventListener("mousemove", (e) => {
@@ -1393,10 +1286,12 @@ export default class MultiPlotterPlugin extends Plugin {
         isDragging = false;
         isPanning = false;
         canvas.classList.remove("is-panning", "is-dragging");
+        state.webglRenderer?.canvas.classList.remove("is-panning", "is-dragging");
       }
     }, { signal: lifecycleController.signal });
 
-    canvas.addEventListener("wheel", (e) => {
+    canvasContainer.addEventListener("wheel", (e) => {
+      if (!isPlotSurface(e.target)) return;
       if (state.locked) return;
       e.preventDefault();
       state.scale = Math.max(2, Math.min(200, state.scale * (e.deltaY > 0 ? 0.9 : 1.1)));
@@ -1422,6 +1317,11 @@ export default class MultiPlotterPlugin extends Plugin {
       if (drawFrame) window.cancelAnimationFrame(drawFrame);
       if (saveTimer !== null) window.clearTimeout(saveTimer);
       window.clearTimeout(initialDrawTimer);
+      resizeObserver.disconnect();
+      state.meshWorker?.terminate();
+      state.webglRenderer?.dispose();
+      state.meshWorker = null;
+      state.webglRenderer = null;
     };
     if (ctx) {
       const renderChild = new MarkdownRenderChild(rootEl);
@@ -1432,6 +1332,20 @@ export default class MultiPlotterPlugin extends Plugin {
   }
 
   drawCanvas(canvas: HTMLCanvasElement, state: PlotUIState, interactive = false): void {
+    if (state.type === "3d" && state.webglRenderer && state.meshWorker) {
+      canvas.style.display = "none";
+      state.webglRenderer.canvas.style.display = "block";
+      state.webglRenderer.labelsElement.style.display = "block";
+      this.drawWebGL(canvas, state, interactive);
+      return;
+    }
+
+    canvas.style.display = "block";
+    if (state.webglRenderer) {
+      state.webglRenderer.canvas.style.display = "none";
+      state.webglRenderer.labelsElement.style.display = "none";
+    }
+
     const rect = canvas.getBoundingClientRect();
     if (!rect || rect.width === 0 || rect.height === 0) return;
 
@@ -1661,7 +1575,7 @@ export default class MultiPlotterPlugin extends Plugin {
       let zMax = initialZMax;
       const implicitVolumes = new Map<PlotRowElement, {
         field: (x: number, y: number, z: number) => number | null;
-        bounds: ImplicitBounds;
+        bounds: PlotBounds3D;
       }>();
 
       state.rows.forEach(row => {
@@ -2264,6 +2178,113 @@ export default class MultiPlotterPlugin extends Plugin {
       ctx.fillStyle = color;
       ctx.fillText(text, px + 6 + padX, py);
     });
+  }
+
+  private drawWebGL(canvas: HTMLCanvasElement, state: PlotUIState, interactive: boolean): void {
+    const renderer = state.webglRenderer;
+    const worker = state.meshWorker;
+    const container = canvas.parentElement;
+    const rect = container?.getBoundingClientRect();
+    if (!renderer || !worker || !rect || rect.width === 0 || rect.height === 0) return;
+
+    const variables: Record<string, number> = {};
+    state.rows.forEach(row => {
+      if (row.type === "var") variables[row.name] = row.value;
+    });
+
+    const surfaces: MeshRequestItem[] = [];
+    const overlays: WebGLOverlayItem[] = [];
+    state.rows.forEach((row, index) => {
+      if (!row.input || row.visible === false || row.type === "var") return;
+      const label = row.labelInput.value.trim();
+      if (row.type === "point") {
+        const point = this.evalVectorExpr(row.input.value, variables);
+        overlays.push({
+          type: "point",
+          origin: [point[0] || 0, point[1] || 0, point[2] || 0],
+          color: row.color,
+          label
+        });
+        return;
+      }
+      if (row.type === "vector") {
+        const origin = this.evalVectorExpr(row.input.value, variables);
+        const direction = this.evalVectorExpr(row.dirInput ? row.dirInput.value : "1,0,0", variables);
+        overlays.push({
+          type: "vector",
+          origin: [origin[0] || 0, origin[1] || 0, origin[2] || 0],
+          direction: [direction[0] || 0, direction[1] || 0, direction[2] || 0],
+          color: row.color,
+          label
+        });
+        return;
+      }
+
+      const expression = row.input.value.trim();
+      if (!expression) return;
+      const isImplicit = row.type === "implicit" ||
+        (expression.includes("=") && /[zZ]/.test(expression) && !/^\s*z\s*=/i.test(expression));
+      surfaces.push({
+        id: index,
+        kind: isImplicit ? "implicit" : "explicit",
+        expression: row.type === "implicit" ? expression : expression,
+        color: row.color,
+        opacity: row.opacity,
+        label
+      });
+    });
+
+    const bounds = state.bounds.length >= 4
+      ? [state.bounds[0], state.bounds[1], state.bounds[2], state.bounds[3], state.bounds.length >= 6 ? state.bounds[4] : -4, state.bounds.length >= 6 ? state.bounds[5] : 4] as PlotBounds3D
+      : [-4, 4, -4, 4, -4, 4] as PlotBounds3D;
+    const resolution = interactive ? 12 : Math.max(24, Math.min(32, state.resolution));
+    const signature = JSON.stringify([surfaces, variables, bounds, resolution, state.showIntersections]);
+    if (signature !== state.meshRequestSignature) {
+      state.meshRequestSignature = signature;
+      state.meshRequestId++;
+      const request: MeshRequest = {
+        requestId: state.meshRequestId,
+        resolution,
+        bounds,
+        variables,
+        showIntersections: state.showIntersections,
+        items: surfaces
+      };
+      try {
+        worker.postMessage(request);
+      } catch (error) {
+        console.error("Could not send plot mesh request:", error);
+        worker.terminate();
+        state.meshWorker = null;
+        renderer.dispose();
+        state.webglRenderer = null;
+        state.webglMeshes = [];
+        state.webglIntersections = new ArrayBuffer(0);
+        canvas.style.display = "block";
+        this.drawCanvas(canvas, state);
+        return;
+      }
+    }
+
+    if (state.webglRenderStyle !== state.renderStyle) {
+      renderer.setMeshes(state.webglMeshes, state.renderStyle, state.webglIntersections);
+      state.webglRenderStyle = state.renderStyle;
+    }
+    const view: WebGLViewState = {
+      width: rect.width,
+      height: rect.height,
+      rotX: state.rotX,
+      rotZ: state.rotZ,
+      scale: state.scale,
+      panX: state.panX,
+      panY: state.panY,
+      bounds: state.webglBounds,
+      renderStyle: state.renderStyle,
+      axisMode: state.axisMode,
+      axesEnabled: state.axesEnabled,
+      showAxisNumbers: state.showAxisNumbers
+    };
+    renderer.render(view, overlays);
   }
 }
 
