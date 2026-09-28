@@ -112,6 +112,8 @@ export interface PlotCamera {
   panX?: number;
   /** Vertical pan displacement in pixels (Default: 20). */
   panY?: number;
+  /** Whether viewport camera and view interaction is locked. */
+  locked?: boolean;
 }
 
 /**
@@ -156,6 +158,8 @@ export interface MathPlotConfig {
   bounds?: [number, number] | [number, number, number, number] | [number, number, number, number, number, number];
   /** Initial camera pose and translation parameters. */
   camera?: PlotCamera;
+  /** Whether viewport camera and view interaction is locked. */
+  locked?: boolean;
   /** Ordered list of mathematical elements, variables, points, and vectors. */
   items: PlotItem[];
 }

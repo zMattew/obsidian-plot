@@ -135,6 +135,15 @@ function isValidVariableName(name: string): boolean {
     !ALLOWED_MATH_FUNCTIONS.has(normalizedName);
 }
 
+const TWO_PI = Math.PI * 2;
+
+function normalizeAngle(rad: number): number {
+  let a = rad % TWO_PI;
+  if (a > Math.PI) a -= TWO_PI;
+  else if (a < -Math.PI) a += TWO_PI;
+  return a;
+}
+
 export default class MultiPlotterPlugin extends Plugin {
   blockRegistry: WeakMap<HTMLElement, { skipNextRender: boolean }> = new WeakMap();
   private expressionCompiler = new MathExpressionCompiler();
@@ -434,6 +443,10 @@ export default class MultiPlotterPlugin extends Plugin {
       ? configuredBounds.slice(0, 6) as PlotBounds3D
       : [configuredBounds[0], configuredBounds[1], configuredBounds[2], configuredBounds[3], -4, 4];
 
+    const initialLocked = initialCam.locked !== undefined
+      ? Boolean(initialCam.locked)
+      : (initialConfig.locked !== undefined ? Boolean(initialConfig.locked) : false);
+
     const state: PlotUIState = {
       type: initialConfig.type || "3d",
       renderStyle: initialConfig.renderStyle || "wireframe",
@@ -450,7 +463,7 @@ export default class MultiPlotterPlugin extends Plugin {
       scale: initialCam.scale !== undefined ? initialCam.scale : defaultCam.scale,
       panX: initialCam.panX !== undefined ? initialCam.panX : defaultCam.panX,
       panY: initialCam.panY !== undefined ? initialCam.panY : defaultCam.panY,
-      locked: false,
+      locked: initialLocked,
       webglRenderer: null,
       meshWorker: null,
       meshRequestId: 0,
@@ -568,13 +581,14 @@ export default class MultiPlotterPlugin extends Plugin {
 
     const overlayControls = canvasContainer.createDiv({ cls: "math-overlay-controls" });
 
-    const lockBtn = overlayControls.createEl("button", { text: "🔓", cls: "math-overlay-button" });
+    const lockBtn = overlayControls.createEl("button", { text: state.locked ? "🔒" : "🔓", cls: "math-overlay-button" });
     lockBtn.title = "Lock / Unlock view interaction";
 
     const resetViewBtn = overlayControls.createEl("button", { text: "↺", cls: "math-overlay-button" });
     resetViewBtn.title = "Reset View to standard";
 
     const canvas = canvasContainer.createEl("canvas", { cls: "math-canvas" });
+    canvas.classList.toggle("is-locked", state.locked);
     let webglUnavailable = false;
 
     const disableWebGL = (): void => {
@@ -655,6 +669,7 @@ export default class MultiPlotterPlugin extends Plugin {
       lockBtn.setText(state.locked ? "🔒" : "🔓");
       canvas.classList.toggle("is-locked", state.locked);
       state.webglRenderer?.canvas.classList.toggle("is-locked", state.locked);
+      debouncedSave();
     });
 
     resetViewBtn.addEventListener("click", (e) => {
@@ -737,11 +752,12 @@ export default class MultiPlotterPlugin extends Plugin {
         viewOnly: state.viewOnly,
         bounds: state.bounds,
         camera: {
-          rotX: Math.round(state.rotX * 100) / 100,
-          rotZ: Math.round(state.rotZ * 100) / 100,
+          rotX: Math.round(normalizeAngle(state.rotX) * 100) / 100,
+          rotZ: Math.round(normalizeAngle(state.rotZ) * 100) / 100,
           scale: Math.round(state.scale),
           panX: Math.round(state.panX),
-          panY: Math.round(state.panY)
+          panY: Math.round(state.panY),
+          locked: state.locked
         },
         items: items
       };
@@ -1268,9 +1284,8 @@ export default class MultiPlotterPlugin extends Plugin {
         state.panX += dx;
         state.panY += dy;
       } else if (state.type === "3d") {
-        state.rotZ += dx * 0.01;
-        state.rotX += dy * 0.01;
-        state.rotX = Math.max(0.1, Math.min(Math.PI - 0.1, state.rotX));
+        state.rotZ = normalizeAngle(state.rotZ + dx * 0.01);
+        state.rotX = normalizeAngle(state.rotX + dy * 0.01);
       } else {
         state.panX += dx;
         state.panY += dy;
@@ -1287,6 +1302,7 @@ export default class MultiPlotterPlugin extends Plugin {
         isPanning = false;
         canvas.classList.remove("is-panning", "is-dragging");
         state.webglRenderer?.canvas.classList.remove("is-panning", "is-dragging");
+        debouncedSave();
       }
     }, { signal: lifecycleController.signal });
 
@@ -1296,6 +1312,7 @@ export default class MultiPlotterPlugin extends Plugin {
       e.preventDefault();
       state.scale = Math.max(2, Math.min(200, state.scale * (e.deltaY > 0 ? 0.9 : 1.1)));
       this.drawCanvas(canvas, state);
+      debouncedSave();
     });
 
     copyBtn.addEventListener("click", () => {
