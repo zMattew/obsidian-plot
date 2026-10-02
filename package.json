@@ -6,11 +6,18 @@
     "build": "npm run check && node scripts/build.mjs",
     "dev": "node scripts/build.mjs --watch",
     "check": "tsc --noEmit",
+    "lint": "eslint \"**/*.ts\"",
     "test": "npm run build && node --test tests/*.test.mjs",
     "test:worker": "npm run build && node --test tests/plot-worker.test.mjs"
   },
+  "overrides": {
+    "moment": "^2.31.0"
+  },
   "devDependencies": {
+    "@types/three": "^0.186.0",
     "esbuild": "^0.25.0",
+    "eslint": "^10.11.0",
+    "eslint-plugin-obsidianmd": "^0.4.2",
     "obsidian": "^1.8.7",
     "typescript": "^5.7.3"
   },
