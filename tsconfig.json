@@ -8,5 +8,5 @@
     "skipLibCheck": true,
     "noEmit": true
   },
-  "include": ["main.ts", "types.ts", "math-expression.ts", "implicit-bounds.ts", "plot-protocol.ts", "plot-worker.ts", "webgl-renderer.ts"]
+  "include": ["main.ts", "types.ts", "math-expression.ts", "implicit-bounds.ts", "plot-protocol.ts", "plot-worker.ts", "webgl-renderer.ts", "isosurface.d.ts"]
 }

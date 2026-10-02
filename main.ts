@@ -1,6 +1,10 @@
-import { App, finishRenderMath, MarkdownPostProcessorContext, MarkdownRenderChild, Modal, Plugin, renderMath, TFile } from "obsidian";
-import type { AxesVisibility, MathPlotConfig, PlotItem } from "./types";
+import { App, finishRenderMath, MarkdownPostProcessorContext, MarkdownRenderChild, Modal, Plugin, PluginSettingTab, renderMath, Setting, TFile } from "obsidian";
+import type { AxesVisibility, MathPlotConfig, PlotItem, PlotPiecewiseBranch, PlotSystemEquation } from "./types";
 import { ALLOWED_MATH_FUNCTIONS, MathExpressionCompiler } from "./math-expression";
+import { parsePiecewiseLatex, parseSystemLatex, serializePiecewiseLatex, serializeSystemLatex } from "./piecewise-latex";
+import { findCurveIntersections, findCurveSystemSolutions, findSpatialSolutions } from "./system-solver";
+import { DEFAULT_NAVIGATION_SETTINGS, resolveNavigationAction, type NavigationAction, type PlotNavigationSettings } from "./navigation-settings";
+import { renderMathLabel } from "./math-label";
 import { expandImplicitBounds } from "./implicit-bounds";
 import { WebGLPlotRenderer, type WebGLOverlayItem, type WebGLViewState } from "./webgl-renderer";
 import type { MeshRequest, MeshRequestItem, MeshResponse, PlotBounds3D, RenderedMeshData } from "./plot-protocol";
@@ -29,8 +33,15 @@ type PlotItemData = {
   coords?: string;
   origin?: string;
   dir?: string;
+  components?: string;
+  branches?: PlotPiecewiseBranch[];
+  equations?: PlotSystemEquation[];
+  latex?: string;
+  showIntersections?: boolean;
+  showSolutions?: boolean;
   color?: string;
   opacity?: number;
+  density?: number;
   label?: string;
   visible?: boolean;
   name?: string;
@@ -58,6 +69,13 @@ interface PlotRowElement {
   min?: number;
   max?: number;
   step?: number;
+  density?: number;
+  densityInput?: HTMLInputElement;
+  piecewiseBranches?: Array<{ equationInput: HTMLInputElement; conditionInput: HTMLInputElement }>;
+  latexInput?: HTMLTextAreaElement;
+  systemEquationRows?: Array<{ equationInput: HTMLInputElement; visibleInput: HTMLInputElement }>;
+  systemIntersectionsInput?: HTMLInputElement;
+  systemSolutionsInput?: HTMLInputElement;
   previewEl?: HTMLDivElement;
 }
 
@@ -83,6 +101,7 @@ interface PlotUIState {
   meshRequestId: number;
   meshRequestSignature: string;
   webglMeshes: RenderedMeshData[];
+  canvasLabels: HTMLDivElement | null;
     webglIntersections: ArrayBuffer;
   webglBounds: PlotBounds3D;
   webglRenderStyle: PlotUIState["renderStyle"] | null;
@@ -100,6 +119,8 @@ interface ActiveFunction {
   op: number;
   label: string;
   gridZ: Array<Array<number | null>>;
+  intersectionGroup?: number;
+  showIntersections?: boolean;
 }
 
 interface RenderedImplicitSurface {
@@ -148,13 +169,33 @@ export default class MultiPlotterPlugin extends Plugin {
   blockRegistry: WeakMap<HTMLElement, { skipNextRender: boolean }> = new WeakMap();
   private expressionCompiler = new MathExpressionCompiler();
   private implicitMeshCache = new Map<string, Mesh>();
+  navigationSettings: PlotNavigationSettings = {
+    ...DEFAULT_NAVIGATION_SETTINGS,
+    keys: { ...DEFAULT_NAVIGATION_SETTINGS.keys }
+  };
 
   async onload() {
     this.blockRegistry = new WeakMap();
+    const savedData: unknown = await this.loadData();
+    const savedKeys = isRecord(savedData) && isRecord(savedData.keys) ? savedData.keys : {};
+    const keys = { ...DEFAULT_NAVIGATION_SETTINGS.keys };
+    (Object.keys(keys) as NavigationAction[]).forEach(action => {
+      if (typeof savedKeys[action] === "string") keys[action] = savedKeys[action];
+    });
+    this.navigationSettings = {
+      keys,
+      zoomFactor: isRecord(savedData) && isFiniteNumber(savedData.zoomFactor)
+        ? Math.max(1.02, Math.min(1.5, savedData.zoomFactor))
+        : DEFAULT_NAVIGATION_SETTINGS.zoomFactor,
+      panStep: isRecord(savedData) && isFiniteNumber(savedData.panStep)
+        ? Math.max(5, Math.min(80, savedData.panStep))
+        : DEFAULT_NAVIGATION_SETTINGS.panStep
+    };
+    this.addSettingTab(new PlotSettingsTab(this.app, this));
 
     this.addCommand({
       id: "create-new-graph",
-      name: "Create new graph (Modal UI)",
+      name: "Create new graph (modal UI)",
       editorCallback: (editor) => {
         new MathPlotModal(this.app, this, (markdown) => {
           editor.replaceSelection(markdown);
@@ -195,6 +236,10 @@ export default class MultiPlotterPlugin extends Plugin {
 
       this.buildUI(el, config, ctx, null);
     });
+  }
+
+  async saveNavigationSettings(): Promise<void> {
+    await this.saveData(this.navigationSettings);
   }
 
   parseConfig(raw: string): MathPlotConfig {
@@ -274,6 +319,36 @@ export default class MultiPlotterPlugin extends Plugin {
       } else if (item.type === "vector") {
         if (typeof item.origin !== "string" || typeof item.dir !== "string") {
           throw new Error(`${prefix} must have string 'origin' and 'dir'.`);
+        }
+      } else if (item.type === "vectorField") {
+        const components = typeof item.components === "string" ? item.components.split(",") : [];
+        if (components.length < 2 || components.length > 3 || components.some(component => !component.trim()) ||
+          (item.density !== undefined && (!isFiniteNumber(item.density) || !Number.isInteger(item.density) || item.density < 3 || item.density > 16))) {
+          throw new Error(`${prefix} must have two or three vector-field 'components' and an optional integer 'density' from 3 to 16.`);
+        }
+      } else if (item.type === "piecewise") {
+        if (parsed.type !== "3d") throw new Error(`${prefix} piecewise surfaces must be used in 3D mode.`);
+        if (item.latex !== undefined && typeof item.latex !== "string") throw new Error(`${prefix} 'latex' must be a string.`);
+        if (item.branches === undefined && typeof item.latex === "string") {
+          item.branches = parsePiecewiseLatex(item.latex);
+        }
+        if (!isUnknownArray(item.branches) || item.branches.length < 1 || item.branches.length > 16 ||
+          item.branches.some(branch => !isRecord(branch) || typeof branch.equation !== "string" || !branch.equation.trim() ||
+            typeof branch.condition !== "string" || !branch.condition.trim())) {
+          throw new Error(`${prefix} must have 1 to 16 branches with non-empty 'equation' and 'condition' strings.`);
+        }
+      } else if (item.type === "system") {
+        if (item.latex !== undefined && typeof item.latex !== "string") throw new Error(`${prefix} 'latex' must be a string.`);
+        if (item.equations === undefined && typeof item.latex === "string") {
+          const parsedEquations = parseSystemLatex(item.latex);
+          if (parsedEquations) item.equations = parsedEquations.map(equation => ({ equation, visible: true }));
+        }
+        if (!isUnknownArray(item.equations) || item.equations.length < 2 || item.equations.length > 16 ||
+          item.equations.some(equation => !isRecord(equation) || typeof equation.equation !== "string" || !equation.equation.trim() ||
+            (equation.visible !== undefined && typeof equation.visible !== "boolean")) ||
+          (item.showIntersections !== undefined && typeof item.showIntersections !== "boolean") ||
+          (item.showSolutions !== undefined && typeof item.showSolutions !== "boolean")) {
+          throw new Error(`${prefix} must have 2 to 16 equations and boolean display options.`);
         }
       } else {
         throw new Error(`${prefix} has an unsupported type.`);
@@ -382,6 +457,29 @@ export default class MultiPlotterPlugin extends Plugin {
     });
   }
 
+  private compileVectorField(
+    expression: string,
+    vars: Record<string, number>,
+    dimensions: "2d" | "3d"
+  ): ((x: number, y: number, z: number) => number[]) | null {
+    const coordinates = dimensions === "3d" ? ["x", "y", "z"] : ["x", "y"];
+    const components = expression.split(",").map(component => this.expressionCompiler.compile(component.trim(), vars, coordinates));
+    if (components.length < 2 || components.length > 3 || components.some(component => component === null)) return null;
+
+    return (x, y, z) => {
+      const scope = { ...vars, x, y, z };
+      return components.map(component => {
+        if (!component) return 0;
+        try {
+          const value = component(scope);
+          return typeof value === "number" && Number.isFinite(value) ? value : 0;
+        } catch {
+          return 0;
+        }
+      });
+    };
+  }
+
   buildUI(
     rootEl: HTMLElement,
     initialConfig: MathPlotConfig,
@@ -395,10 +493,13 @@ export default class MultiPlotterPlugin extends Plugin {
 
     const toolbar = wrapper.createDiv({ cls: "math-toolbar" });
 
-    const addBtn = toolbar.createEl("button", { text: "+ Equation" });
-    const addImplicitBtn = toolbar.createEl("button", { text: "+ Implicit" });
-    const addPtBtn = toolbar.createEl("button", { text: "+ Point" });
-    const addVecBtn = toolbar.createEl("button", { text: "+ Vector" });
+    const addBtn = toolbar.createEl("button", { text: "+ equation" });
+    const addImplicitBtn = toolbar.createEl("button", { text: "+ implicit" });
+    const addPtBtn = toolbar.createEl("button", { text: "+ point" });
+    const addVecBtn = toolbar.createEl("button", { text: "+ vector" });
+    const addFieldBtn = toolbar.createEl("button", { text: "+ vector field" });
+    const addPiecewiseBtn = toolbar.createEl("button", { text: "+ piecewise" });
+    const addSystemBtn = toolbar.createEl("button", { text: "+ system" });
 
     let insertBtn: HTMLButtonElement | null = null;
     if (onInsertCallback) {
@@ -469,11 +570,13 @@ export default class MultiPlotterPlugin extends Plugin {
       meshRequestId: 0,
       meshRequestSignature: "",
       webglMeshes: [],
+      canvasLabels: null,
       webglIntersections: new ArrayBuffer(0),
       webglBounds,
       webglRenderStyle: null
     };
     addImplicitBtn.disabled = state.type !== "3d";
+    addPiecewiseBtn.disabled = state.type !== "3d";
 
     const tracker = { skipNextRender: false };
     this.blockRegistry.set(rootEl, tracker);
@@ -578,16 +681,19 @@ export default class MultiPlotterPlugin extends Plugin {
     const rowsContainer = wrapper.createDiv({ cls: "math-rows-container" });
 
     const canvasContainer = wrapper.createDiv({ cls: "math-canvas-container" });
+    canvasContainer.tabIndex = 0;
+    canvasContainer.setAttribute("aria-label", "Interactive plot canvas");
 
     const overlayControls = canvasContainer.createDiv({ cls: "math-overlay-controls" });
 
     const lockBtn = overlayControls.createEl("button", { text: state.locked ? "🔒" : "🔓", cls: "math-overlay-button" });
-    lockBtn.title = "Lock / Unlock view interaction";
+    lockBtn.title = "Lock / unlock view interaction";
 
     const resetViewBtn = overlayControls.createEl("button", { text: "↺", cls: "math-overlay-button" });
-    resetViewBtn.title = "Reset View to standard";
+    resetViewBtn.title = "Reset view to standard";
 
     const canvas = canvasContainer.createEl("canvas", { cls: "math-canvas" });
+    state.canvasLabels = canvasContainer.createDiv({ cls: "math-canvas-label-layer" });
     canvas.classList.toggle("is-locked", state.locked);
     let webglUnavailable = false;
 
@@ -600,7 +706,7 @@ export default class MultiPlotterPlugin extends Plugin {
       state.webglIntersections = new ArrayBuffer(0);
       state.meshRequestSignature = "";
       state.webglRenderStyle = null;
-      canvas.style.display = "block";
+      canvas.classList.remove("math-hidden");
       this.drawCanvas(canvas, state);
     };
 
@@ -614,15 +720,17 @@ export default class MultiPlotterPlugin extends Plugin {
         renderer = new WebGLPlotRenderer(canvasContainer);
         const workerPath = `${pluginDirectory.replace(/[\\/]+$/, "")}/plot-worker.js`;
         const adapter = this.app.vault.adapter as typeof this.app.vault.adapter & {
-          getResourcePath?: (normalizedPath: string) => string;
+          getResourcePath?: (normalizedPath: string) => unknown;
         };
         if (!adapter.getResourcePath) throw new Error("This Obsidian version cannot resolve plugin worker assets.");
-        worker = new Worker(adapter.getResourcePath.call(adapter, workerPath));
+        const workerUrl = adapter.getResourcePath(workerPath);
+        if (typeof workerUrl !== "string") throw new Error("Obsidian returned an invalid mesh worker URL.");
+        worker = new Worker(workerUrl);
 
         state.webglRenderer = renderer;
         state.meshWorker = worker;
         state.webglRenderStyle = state.renderStyle;
-        canvas.style.display = "none";
+        canvas.classList.add("math-hidden");
         renderer.canvas.classList.toggle("is-locked", state.locked);
         renderer.canvas.addEventListener("webglcontextlost", event => {
           event.preventDefault();
@@ -723,6 +831,45 @@ export default class MultiPlotterPlugin extends Plugin {
             label: r.labelInput ? r.labelInput.value.trim() : "",
             visible: r.visible !== undefined ? r.visible : true
           };
+        } else if (r.type === "vectorField") {
+          return {
+            type: "vectorField",
+            components: r.input ? r.input.value.trim() : "",
+            density: r.density,
+            color: r.color || "#00e676",
+            label: r.labelInput ? r.labelInput.value.trim() : "",
+            visible: r.visible !== undefined ? r.visible : true
+          };
+        } else if (r.type === "piecewise") {
+          const branches = r.piecewiseBranches?.map(branch => ({
+            equation: branch.equationInput.value.trim(),
+            condition: branch.conditionInput.value.trim()
+          })) || [];
+          return {
+            type: "piecewise",
+            branches,
+            latex: r.latexInput?.value || serializePiecewiseLatex(branches),
+            color: r.color || palette[0],
+            opacity: r.opacity !== undefined ? r.opacity : 1,
+            label: r.labelInput ? r.labelInput.value.trim() : "",
+            visible: r.visible !== undefined ? r.visible : true
+          };
+        } else if (r.type === "system") {
+          const equations = r.systemEquationRows?.map(row => ({
+            equation: row.equationInput.value.trim(),
+            visible: row.visibleInput.checked
+          })) || [];
+          return {
+            type: "system",
+            equations,
+            latex: r.latexInput?.value || serializeSystemLatex(equations.map(entry => entry.equation)),
+            showIntersections: r.systemIntersectionsInput?.checked ?? true,
+            showSolutions: r.systemSolutionsInput?.checked ?? true,
+            color: r.color || palette[0],
+            opacity: r.opacity !== undefined ? r.opacity : 1,
+            label: r.labelInput ? r.labelInput.value.trim() : "",
+            visible: r.visible !== undefined ? r.visible : true
+          };
         } else {
           return {
             type: "fn",
@@ -738,6 +885,9 @@ export default class MultiPlotterPlugin extends Plugin {
         if (item.type === "implicit") return item.equation.length > 0;
         if (item.type === "point") return item.coords.length > 0;
         if (item.type === "vector") return item.origin.length > 0;
+        if (item.type === "vectorField") return item.components.length > 0;
+        if (item.type === "piecewise") return item.branches.length > 0;
+        if (item.type === "system") return item.equations.length >= 2;
         return item.fn && item.fn.length > 0;
       });
 
@@ -764,39 +914,45 @@ export default class MultiPlotterPlugin extends Plugin {
     };
 
     let saveTimer: number | null = null;
-    const debouncedSave = () => {
-      if (!ctx || !ctx.sourcePath) return;
-      if (saveTimer !== null) window.clearTimeout(saveTimer);
-      saveTimer = window.setTimeout(async () => {
-        try {
-          if (lifecycleController.signal.aborted) return;
-          if (document.activeElement instanceof HTMLInputElement && wrapper.contains(document.activeElement)) {
-            saveTimer = window.setTimeout(debouncedSave, 1500);
-            return;
-          }
-          const file = this.app.vault.getAbstractFileByPath(ctx.sourcePath);
-          if (!(file instanceof TFile)) return;
-
-          const section = ctx.getSectionInfo(rootEl);
-          if (!section) return;
-
-          const content = await this.app.vault.read(file);
-          if (lifecycleController.signal.aborted) return;
-          const lines = content.split("\n");
-
-          const newBlock = [
-            "```math-plot",
-            JSON.stringify(buildExportJSON(), null, 2),
-            "```"
-          ];
-
-          tracker.skipNextRender = true;
-          lines.splice(section.lineStart, section.lineEnd - section.lineStart + 1, ...newBlock);
-          await this.app.vault.modify(file, lines.join("\n"));
-        } catch (err) {
-          console.error("Auto-save error:", err);
-          tracker.skipNextRender = false;
+    const saveCurrentBlock = async (markdownContext: MarkdownPostProcessorContext, sourcePath: string): Promise<void> => {
+      try {
+        if (lifecycleController.signal.aborted) return;
+        const activeElement = document.activeElement;
+        if (activeElement?.instanceOf(HTMLInputElement) && wrapper.contains(activeElement)) {
+          saveTimer = window.setTimeout(() => debouncedSave(), 1500);
+          return;
         }
+        const file = this.app.vault.getAbstractFileByPath(sourcePath);
+        if (!(file instanceof TFile)) return;
+
+        const section = markdownContext.getSectionInfo(rootEl);
+        if (!section) return;
+
+        const content = await this.app.vault.read(file);
+        if (lifecycleController.signal.aborted) return;
+        const lines = content.split("\n");
+        const newBlock = [
+          "```math-plot",
+          JSON.stringify(buildExportJSON(), null, 2),
+          "```"
+        ];
+
+        tracker.skipNextRender = true;
+        lines.splice(section.lineStart, section.lineEnd - section.lineStart + 1, ...newBlock);
+        await this.app.vault.modify(file, lines.join("\n"));
+      } catch (error) {
+        console.error("Auto-save error:", error);
+        tracker.skipNextRender = false;
+      }
+    };
+
+    const debouncedSave = (): void => {
+      const markdownContext = ctx;
+      const sourcePath = markdownContext?.sourcePath;
+      if (!markdownContext || !sourcePath) return;
+      if (saveTimer !== null) window.clearTimeout(saveTimer);
+      saveTimer = window.setTimeout(() => {
+        void saveCurrentBlock(markdownContext, sourcePath);
       }, 1500);
     };
 
@@ -826,6 +982,7 @@ export default class MultiPlotterPlugin extends Plugin {
       state.webglBounds = [-4, 4, -4, 4, -4, 4];
       state.meshRequestSignature = "";
       addImplicitBtn.disabled = state.type !== "3d";
+      addPiecewiseBtn.disabled = state.type !== "3d";
       zWrap.classList.toggle("math-hidden", state.type !== "3d");
       initializeWebGL();
       this.drawCanvas(canvas, state);
@@ -924,7 +1081,7 @@ export default class MultiPlotterPlugin extends Plugin {
       try {
         const mathNode = renderMath(formula, false);
         previewEl.appendChild(mathNode);
-        finishRenderMath();
+        void finishRenderMath();
       } catch {
         previewEl.setText(formula);
       }
@@ -1004,8 +1161,10 @@ export default class MultiPlotterPlugin extends Plugin {
       state.rows.push(itemRef);
 
       const updateBadgeVisual = () => {
-        colorBadge.style.backgroundColor = itemRef.color;
-        colorBadge.style.opacity = String(Math.max(0.2, itemRef.opacity));
+        colorBadge.setCssProps({
+          "--plot-color": itemRef.color,
+          "--plot-opacity": String(Math.max(0.2, itemRef.opacity))
+        });
         alphaValueSpan.setText(`${Math.round(itemRef.opacity * 100)}%`);
       };
       updateBadgeVisual();
@@ -1089,6 +1248,230 @@ export default class MultiPlotterPlugin extends Plugin {
         dirInput.addEventListener("input", () => {
           this.drawCanvas(canvas, state);
           debouncedSave();
+        });
+        return;
+      }
+
+      if (itemRef.type === "vectorField") {
+        bodyContainer.createSpan({ text: "F:", cls: "math-item-type-badge" });
+        const componentsInput = bodyContainer.createEl("input", {
+          type: "text",
+          placeholder: "P(x,y), Q(x,y), R(x,y,z)",
+          cls: "math-vector-input"
+        });
+        componentsInput.value = itemData?.components || "-y, x, 0";
+        itemRef.input = componentsInput;
+        itemRef.density = Number(itemData?.density ?? 6);
+
+        const densityInput = bodyContainer.createEl("input", { type: "number", cls: "math-variable-number" });
+        densityInput.min = "3";
+        densityInput.max = "16";
+        densityInput.step = "1";
+        densityInput.title = "Sampling density";
+        densityInput.value = String(itemRef.density);
+        itemRef.densityInput = densityInput;
+
+        const updateField = (): void => {
+          this.drawCanvas(canvas, state);
+          debouncedSave();
+        };
+        componentsInput.addEventListener("input", updateField);
+        densityInput.addEventListener("change", () => {
+          const value = Number(densityInput.value);
+          if (!Number.isFinite(value)) return;
+          itemRef.density = Math.max(3, Math.min(16, Math.round(value)));
+          densityInput.value = String(itemRef.density);
+          updateField();
+        });
+        return;
+      }
+
+      if (itemRef.type === "piecewise") {
+        row.classList.add("math-piecewise-row");
+        const piecewiseEditor = bodyContainer.createDiv({ cls: "math-piecewise-editor" });
+        const branchContainer = piecewiseEditor.createDiv({ cls: "math-piecewise-branches" });
+        const latexTools = piecewiseEditor.createDiv({ cls: "math-piecewise-tools" });
+        const addBranchButton = latexTools.createEl("button", { text: "+ branch" });
+        const latexModeButton = latexTools.createEl("button", { text: "Edit LaTeX" });
+        const latexInput = piecewiseEditor.createEl("textarea", { cls: "math-piecewise-latex" });
+        latexInput.rows = 4;
+        itemRef.latexInput = latexInput;
+        const defaultBranches = [{ equation: "x + y", condition: "z >= 0" }];
+        const initialBranches = itemData?.branches?.length
+          ? itemData.branches
+          : (itemData?.latex ? parsePiecewiseLatex(itemData.latex) : null) || defaultBranches;
+        latexInput.value = itemData?.latex || serializePiecewiseLatex(initialBranches);
+        latexInput.classList.add("math-hidden");
+
+        const renderBranches = (branches: PlotPiecewiseBranch[]): void => {
+          branchContainer.empty();
+          itemRef.piecewiseBranches = [];
+          addBranchButton.disabled = branches.length >= 16;
+          branches.forEach((branch, branchIndex) => {
+            const branchRow = branchContainer.createDiv({ cls: "math-piecewise-branch" });
+            const equationInput = branchRow.createEl("input", { type: "text", placeholder: "z = f(x,y) or F(x,y,z)=0" });
+            equationInput.value = branch.equation;
+            const conditionInput = branchRow.createEl("input", { type: "text", placeholder: "condition, e.g. z >= 0" });
+            conditionInput.value = branch.condition;
+            const removeBranchButton = branchRow.createEl("button", { text: "×", attr: { "aria-label": "Remove branch" } });
+            const branchInputs = { equationInput, conditionInput };
+            itemRef.piecewiseBranches?.push(branchInputs);
+            if (branchIndex === 0) itemRef.input = equationInput;
+
+            const updateFromRows = (): void => {
+              const values = (itemRef.piecewiseBranches || []).map(inputs => ({
+                equation: inputs.equationInput.value.trim(),
+                condition: inputs.conditionInput.value.trim()
+              }));
+              latexInput.value = serializePiecewiseLatex(values);
+              this.drawCanvas(canvas, state);
+              debouncedSave();
+            };
+            equationInput.addEventListener("input", updateFromRows);
+            conditionInput.addEventListener("input", updateFromRows);
+            removeBranchButton.disabled = branches.length <= 1;
+            removeBranchButton.addEventListener("click", () => {
+              const updated = (itemRef.piecewiseBranches || []).filter(inputs => inputs !== branchInputs).map(inputs => ({
+                equation: inputs.equationInput.value,
+                condition: inputs.conditionInput.value
+              }));
+              renderBranches(updated);
+              updateFromRows();
+            });
+          });
+        };
+
+        renderBranches(initialBranches);
+        addBranchButton.addEventListener("click", () => {
+          const branches = (itemRef.piecewiseBranches || []).map(inputs => ({
+            equation: inputs.equationInput.value,
+            condition: inputs.conditionInput.value
+          }));
+          branches.push({ equation: "", condition: "" });
+          renderBranches(branches);
+          latexInput.value = serializePiecewiseLatex(branches);
+          this.drawCanvas(canvas, state);
+          debouncedSave();
+        });
+        latexModeButton.addEventListener("click", () => {
+          const showLatex = latexInput.classList.contains("math-hidden");
+          latexInput.classList.toggle("math-hidden", !showLatex);
+          branchContainer.classList.toggle("math-hidden", showLatex);
+          latexModeButton.setText(showLatex ? "Edit rows" : "Edit LaTeX");
+        });
+        latexInput.addEventListener("input", () => {
+          const branches = parsePiecewiseLatex(latexInput.value);
+          if (branches) {
+            renderBranches(branches);
+            latexInput.removeAttribute("aria-invalid");
+          } else {
+            latexInput.setAttribute("aria-invalid", "true");
+          }
+          this.drawCanvas(canvas, state);
+          debouncedSave();
+        });
+        return;
+      }
+
+      if (itemRef.type === "system") {
+        row.classList.add("math-piecewise-row");
+        const systemEditor = bodyContainer.createDiv({ cls: "math-piecewise-editor" });
+        const equationContainer = systemEditor.createDiv({ cls: "math-piecewise-branches" });
+        const controls = systemEditor.createDiv({ cls: "math-piecewise-tools math-system-options" });
+        const addEquationButton = controls.createEl("button", { text: "+ equation" });
+        const latexModeButton = controls.createEl("button", { text: "Edit LaTeX" });
+        const intersectionsLabel = controls.createEl("label", { cls: "math-system-toggle" });
+        intersectionsLabel.createSpan({ text: "Intersections" });
+        const intersectionsInput = intersectionsLabel.createEl("input", { type: "checkbox" });
+        intersectionsInput.checked = itemData?.showIntersections ?? true;
+        itemRef.systemIntersectionsInput = intersectionsInput;
+        const solutionsLabel = controls.createEl("label", { cls: "math-system-toggle" });
+        solutionsLabel.createSpan({ text: "Solutions" });
+        const solutionsInput = solutionsLabel.createEl("input", { type: "checkbox" });
+        solutionsInput.checked = itemData?.showSolutions ?? true;
+        itemRef.systemSolutionsInput = solutionsInput;
+
+        const latexInput = systemEditor.createEl("textarea", { cls: "math-piecewise-latex" });
+        latexInput.rows = 4;
+        itemRef.latexInput = latexInput;
+        const initialEquations = itemData?.equations?.length
+          ? itemData.equations
+          : (itemData?.latex ? parseSystemLatex(itemData.latex)?.map(equation => ({ equation, visible: true })) : null) || [
+            { equation: "y = x", visible: true },
+            { equation: "y = 2 - x", visible: true }
+          ];
+        latexInput.value = itemData?.latex || serializeSystemLatex(initialEquations.map(entry => entry.equation));
+        latexInput.classList.add("math-hidden");
+
+        const renderEquations = (equations: string[], visibility: boolean[] = []): void => {
+          equationContainer.empty();
+          itemRef.systemEquationRows = [];
+          addEquationButton.disabled = equations.length >= 16;
+          equations.forEach((equation, equationIndex) => {
+            const equationRow = equationContainer.createDiv({ cls: "math-piecewise-branch math-system-equation" });
+            const equationInput = equationRow.createEl("input", { type: "text", placeholder: state.type === "2d" ? "y = f(x)" : "z = f(x,y) or F=0" });
+            equationInput.value = equation;
+            const visibleInput = equationRow.createEl("input", { type: "checkbox" });
+            visibleInput.checked = visibility[equationIndex] ?? true;
+            visibleInput.title = "Show equation";
+            const removeEquationButton = equationRow.createEl("button", { text: "×", attr: { "aria-label": "Remove equation" } });
+            const equationRowData = { equationInput, visibleInput };
+            itemRef.systemEquationRows?.push(equationRowData);
+            if (equationIndex === 0) itemRef.input = equationInput;
+
+            const updateFromRows = (): void => {
+              const current = itemRef.systemEquationRows || [];
+              latexInput.value = serializeSystemLatex(current.map(entry => entry.equationInput.value.trim()));
+              this.drawCanvas(canvas, state);
+              debouncedSave();
+            };
+            equationInput.addEventListener("input", updateFromRows);
+            visibleInput.addEventListener("change", () => {
+              this.drawCanvas(canvas, state);
+              debouncedSave();
+            });
+            removeEquationButton.disabled = equations.length <= 2;
+            removeEquationButton.addEventListener("click", () => {
+              const current = itemRef.systemEquationRows || [];
+              const remaining = current.filter(entry => entry !== equationRowData);
+              renderEquations(remaining.map(entry => entry.equationInput.value), remaining.map(entry => entry.visibleInput.checked));
+              updateFromRows();
+            });
+          });
+        };
+
+        renderEquations(initialEquations.map(entry => entry.equation), initialEquations.map(entry => entry.visible !== false));
+        const updateSystem = (): void => {
+          this.drawCanvas(canvas, state);
+          debouncedSave();
+        };
+        addEquationButton.addEventListener("click", () => {
+          const current = itemRef.systemEquationRows || [];
+          renderEquations(
+            [...current.map(entry => entry.equationInput.value), ""],
+            [...current.map(entry => entry.visibleInput.checked), true]
+          );
+          latexInput.value = serializeSystemLatex((itemRef.systemEquationRows || []).map(entry => entry.equationInput.value));
+          updateSystem();
+        });
+        intersectionsInput.addEventListener("change", updateSystem);
+        solutionsInput.addEventListener("change", updateSystem);
+        latexModeButton.addEventListener("click", () => {
+          const showLatex = latexInput.classList.contains("math-hidden");
+          latexInput.classList.toggle("math-hidden", !showLatex);
+          equationContainer.classList.toggle("math-hidden", showLatex);
+          latexModeButton.setText(showLatex ? "Edit rows" : "Edit LaTeX");
+        });
+        latexInput.addEventListener("input", () => {
+          const equations = parseSystemLatex(latexInput.value);
+          if (equations) {
+            const visibility = (itemRef.systemEquationRows || []).map(entry => entry.visibleInput.checked);
+            renderEquations(equations, visibility);
+            latexInput.removeAttribute("aria-invalid");
+          } else {
+            latexInput.setAttribute("aria-invalid", "true");
+          }
+          updateSystem();
         });
         return;
       }
@@ -1246,6 +1629,33 @@ export default class MultiPlotterPlugin extends Plugin {
       debouncedSave();
     });
 
+    addFieldBtn.addEventListener("click", () => {
+      createRow({ type: "vectorField", components: "-y, x, 0", density: 6, color: "#00e676" }, "vectorField", false);
+      this.drawCanvas(canvas, state);
+      debouncedSave();
+    });
+
+    addPiecewiseBtn.addEventListener("click", () => {
+      createRow({
+        type: "piecewise",
+        branches: [
+          { equation: "x + y", condition: "z >= 0" },
+          { equation: "x - y", condition: "z < 0" }
+        ]
+      }, "piecewise", false);
+      this.drawCanvas(canvas, state);
+      debouncedSave();
+    });
+
+    addSystemBtn.addEventListener("click", () => {
+      const equations = state.type === "2d"
+        ? [{ equation: "y = x", visible: true }, { equation: "y = 2 - x", visible: true }]
+        : [{ equation: "x = 0", visible: true }, { equation: "y = 0", visible: true }, { equation: "z = x + y", visible: true }];
+      createRow({ type: "system", equations }, "system", false);
+      this.drawCanvas(canvas, state);
+      debouncedSave();
+    });
+
     let isDragging = false;
     let isPanning = false;
     let lastX = 0;
@@ -1265,6 +1675,7 @@ export default class MultiPlotterPlugin extends Plugin {
     canvasContainer.addEventListener("mousedown", (e) => {
       if (!isPlotSurface(e.target)) return;
       if (state.locked) return;
+      canvasContainer.focus({ preventScroll: true });
       isDragging = true;
       isPanning = Boolean(e.shiftKey || e.button === 1);
       lastX = e.clientX;
@@ -1315,6 +1726,32 @@ export default class MultiPlotterPlugin extends Plugin {
       debouncedSave();
     });
 
+    window.addEventListener("keydown", (event: KeyboardEvent) => {
+      const target = event.target instanceof HTMLElement ? event.target : null;
+      if (state.locked || target?.isContentEditable || target?.matches("input, textarea, select, button")) return;
+      if (!canvasContainer.matches(":hover") && document.activeElement !== canvasContainer) return;
+      const action = resolveNavigationAction(event, this.navigationSettings);
+      if (!action) return;
+
+      event.preventDefault();
+      const settings = this.navigationSettings;
+      if (action === "zoomIn") state.scale = Math.min(200, state.scale * settings.zoomFactor);
+      else if (action === "zoomOut") state.scale = Math.max(2, state.scale / settings.zoomFactor);
+      else if (action === "panUp") state.panY -= settings.panStep;
+      else if (action === "panDown") state.panY += settings.panStep;
+      else if (action === "panLeft") state.panX -= settings.panStep;
+      else if (action === "panRight") state.panX += settings.panStep;
+      else if (action === "resetView") {
+        state.rotX = defaultCam.rotX;
+        state.rotZ = defaultCam.rotZ;
+        state.scale = defaultCam.scale;
+        state.panX = defaultCam.panX;
+        state.panY = defaultCam.panY;
+      }
+      scheduleDraw();
+      debouncedSave();
+    }, { signal: lifecycleController.signal });
+
     copyBtn.addEventListener("click", () => {
       void navigator.clipboard.writeText("```math-plot\n" + JSON.stringify(buildExportJSON(), null, 2) + "\n```\n");
       copyBtn.setText("Copied!");
@@ -1350,17 +1787,22 @@ export default class MultiPlotterPlugin extends Plugin {
 
   drawCanvas(canvas: HTMLCanvasElement, state: PlotUIState, interactive = false): void {
     if (state.type === "3d" && state.webglRenderer && state.meshWorker) {
-      canvas.style.display = "none";
-      state.webglRenderer.canvas.style.display = "block";
-      state.webglRenderer.labelsElement.style.display = "block";
+      canvas.classList.add("math-hidden");
+      state.canvasLabels?.classList.add("math-hidden");
+      state.webglRenderer.canvas.classList.remove("math-hidden");
+      state.webglRenderer.labelsElement.classList.remove("math-hidden");
       this.drawWebGL(canvas, state, interactive);
       return;
     }
 
-    canvas.style.display = "block";
+    canvas.classList.remove("math-hidden");
+    if (state.canvasLabels) {
+      state.canvasLabels.classList.remove("math-hidden");
+      state.canvasLabels.replaceChildren();
+    }
     if (state.webglRenderer) {
-      state.webglRenderer.canvas.style.display = "none";
-      state.webglRenderer.labelsElement.style.display = "none";
+      state.webglRenderer.canvas.classList.add("math-hidden");
+      state.webglRenderer.labelsElement.classList.add("math-hidden");
     }
 
     const rect = canvas.getBoundingClientRect();
@@ -1401,6 +1843,35 @@ export default class MultiPlotterPlugin extends Plugin {
     const queueLabel = (text: string, px: number, py: number, color = "#ffffff"): void => {
       if (!text) return;
       labelsToDraw.push({ text, px, py, color });
+    };
+
+    const queueVectorLabel = (text: string, startX: number, startY: number, endX: number, endY: number, color: string): void => {
+      const dx = endX - startX;
+      const dy = endY - startY;
+      const length = Math.hypot(dx, dy);
+      if (length < 1e-6) {
+        queueLabel(text, endX + 12, endY - 12, color);
+        return;
+      }
+      queueLabel(text, endX + dy / length * 14, endY - dx / length * 14, color);
+    };
+
+    const drawScreenArrow = (startX: number, startY: number, endX: number, endY: number, color: string): void => {
+      const angle = Math.atan2(endY - startY, endX - startX);
+      const headLength = 6;
+      ctx.strokeStyle = color;
+      ctx.fillStyle = color;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(startX, startY);
+      ctx.lineTo(endX, endY);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(endX, endY);
+      ctx.lineTo(endX - headLength * Math.cos(angle - Math.PI / 6), endY - headLength * Math.sin(angle - Math.PI / 6));
+      ctx.lineTo(endX - headLength * Math.cos(angle + Math.PI / 6), endY - headLength * Math.sin(angle + Math.PI / 6));
+      ctx.closePath();
+      ctx.fill();
     };
 
     if (state.type === "2d") {
@@ -1505,6 +1976,78 @@ export default class MultiPlotterPlugin extends Plugin {
         const col = r.color || "#4caf50";
         const label = r.labelInput ? r.labelInput.value.trim() : "";
 
+        if (r.type === "system") {
+          const equations = (r.systemEquationRows || [])
+            .filter(entry => entry.visibleInput.checked && entry.equationInput.value.trim())
+            .map(entry => entry.equationInput.value.trim());
+          const opacity = r.opacity ?? 1;
+          equations.forEach(equation => {
+            const curve = this.latexToJS(equation, currentVars);
+            ctx.strokeStyle = hexToRgba(col, opacity);
+            ctx.lineWidth = 2.5;
+            ctx.beginPath();
+            let started = false;
+            for (let px = 0; px <= w; px += 2) {
+              const x = (px - cx) / pxPerX;
+              const y = curve(x, 0);
+              if (y !== null && Number.isFinite(y)) {
+                const py = cy - y * pyPerY;
+                if (!started) { ctx.moveTo(px, py); started = true; }
+                else ctx.lineTo(px, py);
+              } else {
+                started = false;
+              }
+            }
+            ctx.stroke();
+          });
+
+          const markSolutions = (solutions: Array<{ x: number; y: number }>, color: string): void => {
+            solutions.forEach(solution => {
+              const px = cx + solution.x * pxPerX;
+              const py = cy - solution.y * pyPerY;
+              ctx.fillStyle = color;
+              ctx.beginPath();
+              ctx.arc(px, py, 4.5, 0, Math.PI * 2);
+              ctx.fill();
+              ctx.strokeStyle = "#111111";
+              ctx.lineWidth = 1.2;
+              ctx.stroke();
+            });
+          };
+          if (r.systemIntersectionsInput?.checked) {
+            markSolutions(findCurveIntersections(equations, currentVars, [xMin, xMax]), "#ffeb3b");
+          }
+          if (r.systemSolutionsInput?.checked) {
+            const solutions = findCurveSystemSolutions(equations, currentVars, [xMin, xMax]);
+            markSolutions(solutions, "#00e5ff");
+            if (label && solutions[0]) queueLabel(label, cx + solutions[0].x * pxPerX, cy - solutions[0].y * pyPerY, col);
+          }
+          return;
+        }
+
+        if (r.type === "vectorField") {
+          const field = this.compileVectorField(r.input.value, currentVars, "2d");
+          if (!field) return;
+          const density = Math.max(3, Math.min(16, Math.round(r.density || 6)));
+          const arrowLength = Math.max(10, Math.min(w / density, h / density) * 0.34);
+          for (let row = 0; row <= density; row++) {
+            const y = yMin + (yMax - yMin) * row / density;
+            for (let column = 0; column <= density; column++) {
+              const x = xMin + (xMax - xMin) * column / density;
+              const vector = field(x, y, 0);
+              const screenX = vector[0] * pxPerX;
+              const screenY = -vector[1] * pyPerY;
+              const magnitude = Math.hypot(screenX, screenY);
+              if (magnitude < 1e-9) continue;
+              const startX = cx + x * pxPerX;
+              const startY = cy - y * pyPerY;
+              drawScreenArrow(startX, startY, startX + screenX / magnitude * arrowLength, startY + screenY / magnitude * arrowLength, col);
+            }
+          }
+          if (label) queueLabel(label, cx, cy, col);
+          return;
+        }
+
         if (r.type === "point") {
           const pt = this.evalVectorExpr(r.input.value, currentVars);
           const px = cx + pt[0] * pxPerX;
@@ -1548,7 +2091,7 @@ export default class MultiPlotterPlugin extends Plugin {
           ctx.closePath();
           ctx.fill();
 
-          queueLabel(label, p1x, p1y, col);
+          queueVectorLabel(label, p0x, p0y, p1x, p1y, col);
           return;
         }
 
@@ -1741,13 +2284,114 @@ export default class MultiPlotterPlugin extends Plugin {
 
       const activeFns: ActiveFunction[] = [];
       const implicitSurfaces: RenderedImplicitSurface[] = [];
+      const showCanvasIntersections = state.showIntersections || state.rows.some(row =>
+        row.type === "system" && row.visible && row.systemIntersectionsInput?.checked
+      );
 
-      state.rows.forEach(r => {
+      state.rows.forEach((r, rowIndex) => {
         if (!r.input || r.visible === false) return;
         if (r.type === "var") return;
 
         const col = r.color || "#4caf50";
         const label = r.labelInput ? r.labelInput.value.trim() : "";
+
+        if (r.type === "system") {
+          const equations = (r.systemEquationRows || [])
+            .filter(entry => entry.visibleInput.checked && entry.equationInput.value.trim())
+            .map(entry => entry.equationInput.value.trim());
+          equations.forEach((equation, equationIndex) => {
+            const equationLabel = equationIndex === 0 ? label : "";
+            const isImplicit = equation.includes("=") && /[xyz]/i.test(equation) && !/^\s*z\s*=/i.test(equation);
+            if (isImplicit) {
+              const field = this.latexToImplicit(equation, currentVars);
+              if (!field) return;
+              const dimensions: [number, number, number] = [18, 18, 18];
+              try {
+                const mesh = surfaceNets(
+                  dimensions,
+                  (x, y, z) => field(x, y, z) ?? 1e6,
+                  [[xMin, yMin, initialZMin], [xMax, yMax, initialZMax]]
+                );
+                implicitSurfaces.push({
+                  points: mesh.positions.map(vertex => project(vertex[0], vertex[1], vertex[2])),
+                  cells: mesh.cells,
+                  color: col,
+                  opacity: r.opacity ?? 1,
+                  label: equationLabel
+                });
+              } catch {
+                return;
+              }
+            } else {
+              const fn = this.latexToJS(equation, currentVars);
+              const gridZ: Array<Array<number | null>> = [];
+              for (let rowIndex = 0; rowIndex <= steps; rowIndex++) {
+                const rowZ: Array<number | null> = [];
+                const y = yMin + rowIndex * stepY;
+                for (let columnIndex = 0; columnIndex <= steps; columnIndex++) {
+                  const x = xMin + columnIndex * stepX;
+                  rowZ.push(fn(x, y));
+                }
+                gridZ.push(rowZ);
+              }
+              activeFns.push({
+                fn,
+                col,
+                op: r.opacity ?? 1,
+                label: equationLabel,
+                gridZ,
+                intersectionGroup: rowIndex,
+                showIntersections: r.systemIntersectionsInput?.checked ?? false
+              });
+            }
+          });
+
+          if (r.systemSolutionsInput?.checked) {
+            const solverBounds = state.bounds.length >= 6
+              ? state.bounds as PlotBounds3D
+              : [xMin, xMax, yMin, yMax, initialZMin, initialZMax] as PlotBounds3D;
+            findSpatialSolutions(equations, currentVars, solverBounds).forEach((solution, solutionIndex) => {
+              overlaysToDraw.push(() => {
+                const point = project(solution.x, solution.y, solution.z);
+                ctx.fillStyle = "#00e5ff";
+                ctx.beginPath();
+                ctx.arc(point.px, point.py, 5, 0, Math.PI * 2);
+                ctx.fill();
+                if (solutionIndex === 0 && label) queueLabel(label, point.px, point.py, "#00e5ff");
+              });
+            });
+          }
+          return;
+        }
+
+        if (r.type === "vectorField") {
+          const field = this.compileVectorField(r.input.value, currentVars, "3d");
+          if (!field) return;
+          const density = Math.max(3, Math.min(16, Math.round(r.density || 6)));
+          const fieldBounds = state.bounds.length >= 6 ? state.bounds : [-4, 4, -4, 4, -4, 4];
+          const [fieldXMin, fieldXMax, fieldYMin, fieldYMax, fieldZMin, fieldZMax] = fieldBounds;
+          const arrowLength = Math.min(fieldXMax - fieldXMin, fieldYMax - fieldYMin, fieldZMax - fieldZMin) / density * 0.35;
+          for (let zi = 0; zi < density; zi++) {
+            const z = fieldZMin + (fieldZMax - fieldZMin) * zi / Math.max(1, density - 1);
+            for (let yi = 0; yi < density; yi++) {
+              const y = fieldYMin + (fieldYMax - fieldYMin) * yi / Math.max(1, density - 1);
+              for (let xi = 0; xi < density; xi++) {
+                const x = fieldXMin + (fieldXMax - fieldXMin) * xi / Math.max(1, density - 1);
+                const vector = field(x, y, z);
+                const magnitude = Math.hypot(vector[0], vector[1], vector[2]);
+                if (magnitude < 1e-9) continue;
+                const unit = vector.map(component => component / magnitude);
+                const start = project(x, y, z);
+                const end = project(x + unit[0] * arrowLength, y + unit[1] * arrowLength, z + unit[2] * arrowLength);
+                if (Math.hypot(end.px - start.px, end.py - start.py) > 1e-6) {
+                  drawScreenArrow(start.px, start.py, end.px, end.py, col);
+                }
+              }
+            }
+          }
+          if (label) queueLabel(label, cx, cy, col);
+          return;
+        }
 
         // PUNTI 3D (Accodati in primo piano)
         if (r.type === "point") {
@@ -1807,7 +2451,61 @@ export default class MultiPlotterPlugin extends Plugin {
             ctx.closePath();
             ctx.fill();
 
-            queueLabel(label, p1.px, p1.py, col);
+            queueVectorLabel(label, p0.px, p0.py, p1.px, p1.py, col);
+          });
+          return;
+        }
+
+        if (r.type === "piecewise") {
+          const branches = r.piecewiseBranches?.map(branch => ({
+            equation: branch.equationInput.value.trim(),
+            condition: branch.conditionInput.value.trim()
+          })) || [];
+          branches.forEach((branch, branchIndex) => {
+            const condition = this.expressionCompiler.compileCondition(branch.condition, currentVars, ["x", "y", "z"]);
+            if (!condition || !branch.equation) return;
+            const branchLabel = branchIndex === 0 ? label : "";
+            const isImplicit = branch.equation.includes("=") && /[zZ]/.test(branch.equation) && !/^\s*z\s*=/i.test(branch.equation);
+
+            if (isImplicit) {
+              const field = this.latexToImplicit(branch.equation, currentVars);
+              if (!field) return;
+              const conditionedField = (x: number, y: number, z: number): number | null => {
+                const value = field(x, y, z);
+                return value !== null && condition({ ...currentVars, x, y, z }) ? value : null;
+              };
+              const branchBounds = expandImplicitBounds(conditionedField, [xMin, xMax, yMin, yMax, initialZMin, initialZMax]);
+              const spans = [branchBounds[1] - branchBounds[0], branchBounds[3] - branchBounds[2], branchBounds[5] - branchBounds[4]];
+              const longestSpan = Math.max(...spans);
+              const meshSteps = interactive ? 12 : Math.max(24, Math.min(32, steps));
+              const dimensions = spans.map(span => Math.max(12, Math.ceil(meshSteps * span / longestSpan))) as [number, number, number];
+              try {
+                const mesh = surfaceNets(
+                  dimensions,
+                  (x, y, z) => conditionedField(x, y, z) ?? 1e6,
+                  [[branchBounds[0], branchBounds[2], branchBounds[4]], [branchBounds[1], branchBounds[3], branchBounds[5]]]
+                );
+                const points = mesh.positions.map(vertex => project(vertex[0], vertex[1], vertex[2]));
+                implicitSurfaces.push({ points, cells: mesh.cells, color: col, opacity: r.opacity ?? 1, label: branchLabel });
+              } catch {
+                return;
+              }
+              return;
+            }
+
+            const fn = this.latexToJS(branch.equation, currentVars);
+            const gridZ: Array<Array<number | null>> = [];
+            for (let rowIndex = 0; rowIndex <= steps; rowIndex++) {
+              const rowZ: Array<number | null> = [];
+              const y = yMin + rowIndex * stepY;
+              for (let columnIndex = 0; columnIndex <= steps; columnIndex++) {
+                const x = xMin + columnIndex * stepX;
+                const z = fn(x, y);
+                rowZ.push(z !== null && condition({ ...currentVars, x, y, z }) ? z : null);
+              }
+              gridZ.push(rowZ);
+            }
+            activeFns.push({ fn, col, op: r.opacity ?? 1, label: branchLabel, gridZ });
           });
           return;
         }
@@ -1884,7 +2582,8 @@ export default class MultiPlotterPlugin extends Plugin {
         const rasterWidth = Math.ceil(w * rasterScale);
         const rasterHeight = Math.ceil(h * rasterScale);
         const pixelCount = rasterWidth * rasterHeight;
-        const surfaceCanvas = document.createElement("canvas");
+        const surfaceCanvas = canvas.parentElement?.createEl("canvas", { cls: "math-render-buffer" });
+        if (!surfaceCanvas) return;
         surfaceCanvas.width = rasterWidth;
         surfaceCanvas.height = rasterHeight;
         const surfaceCtx = surfaceCanvas.getContext("2d");
@@ -1999,6 +2698,7 @@ export default class MultiPlotterPlugin extends Plugin {
         ctx.imageSmoothingEnabled = true;
         ctx.imageSmoothingQuality = "high";
         ctx.drawImage(surfaceCanvas, 0, 0, rasterWidth, rasterHeight, 0, 0, w, h);
+        surfaceCanvas.remove();
 
       } else if (state.renderStyle === "points") {
         activeFns.forEach(({ col, op, gridZ }) => {
@@ -2104,13 +2804,19 @@ export default class MultiPlotterPlugin extends Plugin {
       }
 
       // DISEGNA INTERSEZIONI 3D
-      if (state.showIntersections && activeFns.length >= 2) {
+      if (showCanvasIntersections && activeFns.length >= 2) {
         ctx.strokeStyle = "#ffeb3b";
         ctx.lineWidth = 3.5;
         ctx.lineCap = "round";
 
         for (let a = 0; a < activeFns.length; a++) {
           for (let b = a + 1; b < activeFns.length; b++) {
+            const firstFunction = activeFns[a];
+            const secondFunction = activeFns[b];
+            const enabledForGroup = firstFunction.intersectionGroup !== undefined &&
+              firstFunction.intersectionGroup === secondFunction.intersectionGroup &&
+              firstFunction.showIntersections && secondFunction.showIntersections;
+            if (!state.showIntersections && !enabledForGroup) continue;
             const gA = activeFns[a].gridZ;
             const gB = activeFns[b].gridZ;
 
@@ -2176,24 +2882,16 @@ export default class MultiPlotterPlugin extends Plugin {
 
     // DISEGNO DELLE LABEL SEMPRE AL LIVELLO PIÙ ALTO
     labelsToDraw.forEach(({ text, px, py, color }) => {
-      ctx.font = "bold 11px sans-serif";
-      const metrics = ctx.measureText(text);
-      const padX = 5;
-      const padY = 3;
-      const boxW = metrics.width + padX * 2;
-      const boxH = 14 + padY * 2;
-
-      ctx.fillStyle = "rgba(18, 18, 18, 0.95)";
-      ctx.strokeStyle = color;
-      ctx.lineWidth = 1.2;
-
-      ctx.beginPath();
-      ctx.roundRect ? ctx.roundRect(px + 6, py - 12, boxW, boxH, 4) : ctx.rect(px + 6, py - 12, boxW, boxH);
-      ctx.fill();
-      ctx.stroke();
-
-      ctx.fillStyle = color;
-      ctx.fillText(text, px + 6 + padX, py);
+      const labelLayer = state.canvasLabels;
+      if (!labelLayer) return;
+      const element = labelLayer.createDiv({ cls: "math-canvas-label" });
+      element.setCssStyles({
+        left: `${px + 6}px`,
+        top: `${py - 12}px`,
+        borderColor: color,
+        color
+      });
+      renderMathLabel(element, text);
     });
   }
 
@@ -2214,6 +2912,69 @@ export default class MultiPlotterPlugin extends Plugin {
     state.rows.forEach((row, index) => {
       if (!row.input || row.visible === false || row.type === "var") return;
       const label = row.labelInput.value.trim();
+      if (row.type === "system") {
+        const equations = (row.systemEquationRows || [])
+          .filter(entry => entry.visibleInput.checked && entry.equationInput.value.trim())
+          .map(entry => entry.equationInput.value.trim());
+        equations.forEach((equation, equationIndex) => {
+          const isImplicit = equation.includes("=") && /[xyz]/i.test(equation) && !/^\s*z\s*=/i.test(equation);
+          surfaces.push({
+            id: index * 17 + equationIndex,
+            kind: isImplicit ? "implicit" : "explicit",
+            expression: equation,
+            intersectionGroup: index,
+            showIntersections: row.systemIntersectionsInput?.checked ?? false,
+            color: row.color,
+            opacity: row.opacity,
+            label: equationIndex === 0 ? label : ""
+          });
+        });
+
+        if (row.systemSolutionsInput?.checked) {
+          const solverBounds = state.bounds.length >= 6
+            ? state.bounds as PlotBounds3D
+            : [state.bounds[0] ?? -4, state.bounds[1] ?? 4, state.bounds[2] ?? -4, state.bounds[3] ?? 4, -4, 4] as PlotBounds3D;
+          const solutions = findSpatialSolutions(equations, variables, solverBounds);
+          solutions.forEach((solution, solutionIndex) => {
+            overlays.push({
+              type: "point",
+              origin: [solution.x, solution.y, solution.z],
+              color: "#00e5ff",
+              label: solutionIndex === 0 ? label : ""
+            });
+          });
+        }
+        return;
+      }
+      if (row.type === "vectorField") {
+        const field = this.compileVectorField(row.input.value, variables, "3d");
+        if (!field) return;
+        const density = Math.max(3, Math.min(16, Math.round(row.density || 6)));
+        const fieldBounds = state.bounds.length >= 6
+          ? state.bounds
+          : [state.bounds[0] ?? -4, state.bounds[1] ?? 4, state.bounds[2] ?? -4, state.bounds[3] ?? 4, -4, 4];
+        const [xMin, xMax, yMin, yMax, zMin, zMax] = fieldBounds;
+        const vectors: Array<{ origin: [number, number, number]; direction: [number, number, number] }> = [];
+        for (let zi = 0; zi < density; zi++) {
+          const z = zMin + (zMax - zMin) * zi / Math.max(1, density - 1);
+          for (let yi = 0; yi < density; yi++) {
+            const y = yMin + (yMax - yMin) * yi / Math.max(1, density - 1);
+            for (let xi = 0; xi < density; xi++) {
+              const x = xMin + (xMax - xMin) * xi / Math.max(1, density - 1);
+              const value = field(x, y, z);
+              const magnitude = Math.hypot(value[0], value[1], value[2] || 0);
+              if (magnitude < 1e-9) continue;
+              vectors.push({
+                origin: [x, y, z],
+                direction: [value[0] / magnitude, value[1] / magnitude, (value[2] || 0) / magnitude]
+              });
+            }
+          }
+        }
+        const glyphLength = Math.min(xMax - xMin, yMax - yMin, zMax - zMin) / density * 0.35;
+        overlays.push({ type: "vectorField", origin: [0, 0, 0], vectors, length: glyphLength, color: row.color, label });
+        return;
+      }
       if (row.type === "point") {
         const point = this.evalVectorExpr(row.input.value, variables);
         overlays.push({
@@ -2233,6 +2994,27 @@ export default class MultiPlotterPlugin extends Plugin {
           direction: [direction[0] || 0, direction[1] || 0, direction[2] || 0],
           color: row.color,
           label
+        });
+        return;
+      }
+
+      if (row.type === "piecewise") {
+        const branches = row.piecewiseBranches?.map(branch => ({
+          equation: branch.equationInput.value.trim(),
+          condition: branch.conditionInput.value.trim()
+        })) || parsePiecewiseLatex(row.input.value) || [];
+        branches.forEach((branch, branchIndex) => {
+          if (!branch.equation || !branch.condition) return;
+          const isImplicit = branch.equation.includes("=") && /[zZ]/.test(branch.equation) && !/^\s*z\s*=/i.test(branch.equation);
+          surfaces.push({
+            id: index * 17 + branchIndex,
+            kind: isImplicit ? "implicit" : "explicit",
+            expression: branch.equation,
+            condition: branch.condition,
+            color: row.color,
+            opacity: row.opacity,
+            label: branchIndex === 0 ? label : ""
+          });
         });
         return;
       }
@@ -2277,7 +3059,7 @@ export default class MultiPlotterPlugin extends Plugin {
         state.webglRenderer = null;
         state.webglMeshes = [];
         state.webglIntersections = new ArrayBuffer(0);
-        canvas.style.display = "block";
+        canvas.classList.remove("math-hidden");
         this.drawCanvas(canvas, state);
         return;
       }
@@ -2321,7 +3103,7 @@ class MathPlotModal extends Modal {
     contentEl.empty();
     this.modalEl.classList.add("math-plot-modal");
 
-    contentEl.createEl("h2", { text: "Math Plotter - New Graph" });
+    contentEl.createEl("h2", { text: "Math plotter - new graph" });
 
     const freshConfig: MathPlotConfig = {
       type: "3d",
@@ -2351,5 +3133,63 @@ class MathPlotModal extends Modal {
     this.disposeUI?.();
     this.disposeUI = null;
     this.contentEl.empty();
+  }
+}
+
+class PlotSettingsTab extends PluginSettingTab {
+  private plugin: MultiPlotterPlugin;
+
+  constructor(app: App, plugin: MultiPlotterPlugin) {
+    super(app, plugin);
+    this.plugin = plugin;
+  }
+
+  display(): void {
+    const { containerEl } = this;
+    containerEl.empty();
+    new Setting(containerEl).setName("Navigation").setHeading();
+
+    const actionNames: Array<[NavigationAction, string]> = [
+      ["zoomIn", "Zoom in"],
+      ["zoomOut", "Zoom out"],
+      ["panUp", "Pan up"],
+      ["panDown", "Pan down"],
+      ["panLeft", "Pan left"],
+      ["panRight", "Pan right"],
+      ["resetView", "Reset view"]
+    ];
+    actionNames.forEach(([action, name]) => {
+      new Setting(containerEl)
+        .setName(name)
+        .setDesc("Key or modifier combination, e.g. Ctrl+ArrowUp")
+        .addText(input => input
+          .setValue(this.plugin.navigationSettings.keys[action])
+          .onChange(async value => {
+            this.plugin.navigationSettings.keys[action] = value.trim();
+            await this.plugin.saveNavigationSettings();
+          }));
+    });
+
+    new Setting(containerEl)
+      .setName("Zoom step")
+      .setDesc("Scale multiplier for each key press")
+      .addSlider(slider => slider
+        .setLimits(1.02, 1.5, 0.01)
+        .setValue(this.plugin.navigationSettings.zoomFactor)
+        .onChange(async value => {
+          this.plugin.navigationSettings.zoomFactor = value;
+          await this.plugin.saveNavigationSettings();
+        }));
+
+    new Setting(containerEl)
+      .setName("Pan step")
+      .setDesc("Pixels moved for each key press")
+      .addSlider(slider => slider
+        .setLimits(5, 80, 1)
+        .setValue(this.plugin.navigationSettings.panStep)
+        .onChange(async value => {
+          this.plugin.navigationSettings.panStep = value;
+          await this.plugin.saveNavigationSettings();
+        }));
   }
 }

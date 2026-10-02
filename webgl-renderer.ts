@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import { CSS2DObject, CSS2DRenderer } from "three/addons/renderers/CSS2DRenderer.js";
 import type { RenderedMeshData } from "./plot-protocol";
+import { renderMathLabel } from "./math-label";
 
 export interface WebGLViewState {
   width: number;
@@ -17,13 +18,17 @@ export interface WebGLViewState {
   showAxisNumbers: boolean;
 }
 
-export interface WebGLOverlayItem {
-  type: "point" | "vector";
-  origin: [number, number, number];
-  direction?: [number, number, number];
-  color: string;
-  label: string;
-}
+export type WebGLOverlayItem =
+  | { type: "point"; origin: [number, number, number]; color: string; label: string }
+  | { type: "vector"; origin: [number, number, number]; direction: [number, number, number]; color: string; label: string }
+  | {
+      type: "vectorField";
+      origin: [number, number, number];
+      vectors: Array<{ origin: [number, number, number]; direction: [number, number, number] }>;
+      length: number;
+      color: string;
+      label: string;
+    };
 
 function disposeGroup(group: THREE.Group): void {
   group.traverse(object => {
@@ -38,7 +43,7 @@ function disposeGroup(group: THREE.Group): void {
 
 export class WebGLPlotRenderer {
   readonly canvas: HTMLCanvasElement;
-  readonly labelsElement: HTMLDivElement;
+  readonly labelsElement: HTMLElement;
   private renderer: THREE.WebGLRenderer;
   private labelRenderer: CSS2DRenderer;
   private scene = new THREE.Scene();
@@ -50,6 +55,7 @@ export class WebGLPlotRenderer {
   private overlays = new THREE.Group();
   private meshLabels = new THREE.Group();
   private axisLabels = new THREE.Group();
+  private vectorLabels: Array<{ label: CSS2DObject; origin: THREE.Vector3; direction: THREE.Vector3 }> = [];
   private lastDecorationKey = "";
 
   constructor(container: HTMLElement) {
@@ -164,6 +170,7 @@ export class WebGLPlotRenderer {
       this.rebuildAxes(view);
       this.rebuildOverlays(items);
     }
+    this.updateVectorLabelOffsets();
 
     this.renderer.render(this.scene, this.camera);
     this.labelRenderer.render(this.scene, this.camera);
@@ -248,33 +255,84 @@ export class WebGLPlotRenderer {
 
   private rebuildOverlays(items: WebGLOverlayItem[]): void {
     disposeGroup(this.overlays);
+    this.vectorLabels = [];
     items.forEach(item => {
       const origin = new THREE.Vector3(...item.origin);
       let labelPosition = origin;
+      let vectorLabelDirection: THREE.Vector3 | null = null;
       if (item.type === "point") {
         this.overlays.add(new THREE.Mesh(
           new THREE.SphereGeometry(0.1, 12, 8),
           new THREE.MeshBasicMaterial({ color: item.color })
         ).translateX(origin.x).translateY(origin.y).translateZ(origin.z));
-      } else if (item.direction) {
+      } else if (item.type === "vector") {
         const direction = new THREE.Vector3(...item.direction);
         const length = direction.length();
         if (length === 0) return;
-        this.overlays.add(new THREE.ArrowHelper(direction.normalize(), origin, length, item.color, Math.min(0.25, length * 0.25), Math.min(0.15, length * 0.15)));
-        labelPosition = origin.clone().add(new THREE.Vector3(...item.direction));
+        this.overlays.add(new THREE.ArrowHelper(direction.clone().normalize(), origin, length, item.color, Math.min(0.25, length * 0.25), Math.min(0.15, length * 0.15)));
+        vectorLabelDirection = direction;
+        labelPosition = origin.clone().add(direction);
+      } else {
+        const segments: THREE.Vector3[] = [];
+        const addSegment = (start: THREE.Vector3, end: THREE.Vector3): void => {
+          segments.push(start, end);
+        };
+        item.vectors.forEach(vector => {
+          const start = new THREE.Vector3(...vector.origin);
+          const direction = new THREE.Vector3(...vector.direction).normalize();
+          if (direction.lengthSq() === 0) return;
+          const end = start.clone().addScaledVector(direction, item.length);
+          const referenceAxis = Math.abs(direction.z) < 0.9
+            ? new THREE.Vector3(0, 0, 1)
+            : new THREE.Vector3(0, 1, 0);
+          const side = new THREE.Vector3().crossVectors(direction, referenceAxis).normalize();
+          const headBase = end.clone().addScaledVector(direction, -item.length * 0.24);
+          const halfWidth = item.length * 0.09;
+          addSegment(start, end);
+          addSegment(end, headBase.clone().addScaledVector(side, halfWidth));
+          addSegment(end, headBase.clone().addScaledVector(side, -halfWidth));
+        });
+        if (segments.length > 0) {
+          const geometry = new THREE.BufferGeometry().setFromPoints(segments);
+          this.overlays.add(new THREE.LineSegments(geometry, new THREE.LineBasicMaterial({ color: item.color })));
+        }
       }
-      if (item.label) this.addLabel(this.axisLabels, item.label, labelPosition, item.color);
+      if (item.label) {
+        const label = this.addLabel(this.axisLabels, item.label, labelPosition, item.color);
+        if (vectorLabelDirection) this.vectorLabels.push({ label, origin: origin.clone(), direction: vectorLabelDirection });
+      }
     });
   }
 
-  private addLabel(group: THREE.Group, text: string, position: THREE.Vector3, color: string): void {
-    const element = document.createElement("div");
-    element.className = "math-webgl-label";
-    element.textContent = text;
-    element.style.borderColor = color;
-    element.style.color = color;
+  private updateVectorLabelOffsets(): void {
+    if (this.vectorLabels.length === 0) return;
+    this.world.updateMatrixWorld(true);
+    this.camera.updateMatrixWorld(true);
+    this.vectorLabels.forEach(({ label, origin, direction }) => {
+      const start = this.world.localToWorld(origin.clone()).project(this.camera);
+      const end = this.world.localToWorld(origin.clone().add(direction)).project(this.camera);
+      const dx = end.x - start.x;
+      const dy = end.y - start.y;
+      const length = Math.hypot(dx, dy);
+      const element = label.element as HTMLDivElement;
+      if (length < 1e-6) {
+        element.setCssStyles({ marginLeft: "12px", marginTop: "-12px" });
+      } else {
+        element.setCssStyles({
+          marginLeft: `${dy / length * 14}px`,
+          marginTop: `${-dx / length * 14}px`
+        });
+      }
+    });
+  }
+
+  private addLabel(group: THREE.Group, text: string, position: THREE.Vector3, color: string): CSS2DObject {
+    const element = this.labelsElement.createDiv({ cls: "math-webgl-label" });
+    element.setCssStyles({ borderColor: color, color });
+    renderMathLabel(element, text);
     const label = new CSS2DObject(element);
     label.position.copy(position);
     group.add(label);
+    return label;
   }
 }

@@ -1,4 +1,4 @@
-import { parse } from "mathjs";
+import { parse, type MathNode } from "mathjs";
 
 export const ALLOWED_MATH_FUNCTIONS = new Set([
   "abs", "acos", "asin", "atan", "ceil", "cos", "cosh", "exp", "floor", "log", "max", "min",
@@ -6,7 +6,60 @@ export const ALLOWED_MATH_FUNCTIONS = new Set([
 ]);
 
 const ALLOWED_MATH_OPERATORS = new Set(["+", "-", "*", "/", "%", "^"]);
+const ALLOWED_CONDITION_OPERATORS = new Set([
+  ...ALLOWED_MATH_OPERATORS,
+  "<", "<=", ">", ">=", "==", "!=", "and", "or"
+]);
 
+function normalizeExpression(source: string): string {
+  let expression = replaceLatexCommandGroups(source, "sqrt", 1, args => `sqrt((${args[0]}))`);
+  expression = expression.replace(/\\sqrt\s*([a-zA-Z0-9])/g, "sqrt($1)");
+  expression = replaceLatexCommandGroups(expression, "frac", 2, args => `((${args[0]})/(${args[1]}))`);
+  expression = replaceLatexCommandGroups(expression, "max", 1, args => `max(${unwrapOuterParentheses(args[0])})`);
+  expression = replaceLatexCommandGroups(expression, "min", 1, args => `min(${unwrapOuterParentheses(args[0])})`);
+
+  while (/\|([^|]+)\|/.test(expression)) {
+    expression = expression.replace(/\|([^|]+)\|/g, "abs($1)");
+  }
+
+  expression = expression.replace(/\\ln\b/g, "log");
+  expression = expression.replace(/\\(arcsin|arccos|arctan)\b/g, (_match, name: string) => name.slice(3));
+  expression = expression.replace(/\\(sin|cos|tan|asin|acos|atan|sinh|cosh|tanh|exp|log|max|min|ceil|floor|pow|round|sign)\b/g, "$1");
+  expression = expression.replace(/\\cdot|\\times/g, "*");
+  expression = expression.replace(/\\pi/g, "pi");
+  expression = expression.replace(/\\left|\\right/g, "");
+  expression = expression.replace(/\bMath\.PI\b/gi, "pi").replace(/\bMath\.E\b/g, "e");
+  expression = expression.replace(/\bMath\./g, "");
+  expression = expression.replace(/\{/g, "(").replace(/\}/g, ")");
+  expression = expression.replace(/([xXyY])\s+([xXyY])/g, "$1*$2");
+  return expression;
+}
+
+function isSafeExpression(
+  node: MathNode,
+  allowedSymbols: Set<string>,
+  allowedOperators: Set<string>
+): boolean {
+  let isSafe = true;
+  node.traverse((child) => {
+    const childNode = child as { type: string; name?: string; op?: string };
+    if (childNode.type === "ConstantNode" || childNode.type === "ParenthesisNode") return;
+    if (childNode.type === "SymbolNode") {
+      if (!allowedSymbols.has(childNode.name || "")) isSafe = false;
+      return;
+    }
+    if (childNode.type === "OperatorNode") {
+      if (!allowedOperators.has(childNode.op || "")) isSafe = false;
+      return;
+    }
+    if (childNode.type === "FunctionNode") {
+      if (!ALLOWED_MATH_FUNCTIONS.has(childNode.name || "")) isSafe = false;
+      return;
+    }
+    isSafe = false;
+  });
+  return isSafe;
+}
 function replaceLatexCommandGroups(
   expression: string,
   command: string,
@@ -91,53 +144,13 @@ export class MathExpressionCompiler {
       return null;
     }
 
-    const cacheKey = `${source}\u0000${Object.keys(vars).sort().join(",")}\u0000${coordinates.join(",")}`;
+    const cacheKey = `math\u0000${source}\u0000${Object.keys(vars).sort().join(",")}\u0000${coordinates.join(",")}`;
     let evaluate = this.compiled.get(cacheKey);
     if (evaluate === undefined) {
-      let expression = replaceLatexCommandGroups(source, "sqrt", 1, args => `sqrt((${args[0]}))`);
-      expression = expression.replace(/\\sqrt\s*([a-zA-Z0-9])/g, "sqrt($1)");
-      expression = replaceLatexCommandGroups(expression, "frac", 2, args => `((${args[0]})/(${args[1]}))`);
-      expression = replaceLatexCommandGroups(expression, "max", 1, args => `max(${unwrapOuterParentheses(args[0])})`);
-      expression = replaceLatexCommandGroups(expression, "min", 1, args => `min(${unwrapOuterParentheses(args[0])})`);
-
-      while (/\|([^|]+)\|/.test(expression)) {
-        expression = expression.replace(/\|([^|]+)\|/g, "abs($1)");
-      }
-
-      expression = expression.replace(/\\ln\b/g, "log");
-      expression = expression.replace(/\\(arcsin|arccos|arctan)\b/g, (_match, name: string) => name.slice(3));
-      expression = expression.replace(/\\(sin|cos|tan|asin|acos|atan|sinh|cosh|tanh|exp|log|max|min|ceil|floor|pow|round|sign)\b/g, "$1");
-      expression = expression.replace(/\\cdot|\\times/g, "*");
-      expression = expression.replace(/\\pi/g, "pi");
-      expression = expression.replace(/\\left|\\right/g, "");
-      expression = expression.replace(/\bMath\.PI\b/gi, "pi").replace(/\bMath\.E\b/g, "e");
-      expression = expression.replace(/\bMath\./g, "");
-      expression = expression.replace(/\{/g, "(").replace(/\}/g, ")");
-      expression = expression.replace(/([xXyY])\s+([xXyY])/g, "$1*$2");
-
       try {
-        const node = parse(expression);
+        const node = parse(normalizeExpression(source));
         const allowedSymbols = new Set(["e", "pi", ...coordinates, ...Object.keys(vars), ...ALLOWED_MATH_FUNCTIONS]);
-        let isSafe = true;
-        node.traverse((child) => {
-          const childNode = child as { type: string; name?: string; op?: string };
-          if (childNode.type === "ConstantNode" || childNode.type === "ParenthesisNode") return;
-          if (childNode.type === "SymbolNode") {
-            if (!allowedSymbols.has(childNode.name || "")) isSafe = false;
-            return;
-          }
-          if (childNode.type === "OperatorNode") {
-            if (!ALLOWED_MATH_OPERATORS.has(childNode.op || "")) isSafe = false;
-            return;
-          }
-          if (childNode.type === "FunctionNode") {
-            if (!ALLOWED_MATH_FUNCTIONS.has(childNode.name || "")) isSafe = false;
-            return;
-          }
-          isSafe = false;
-        });
-
-        if (isSafe) {
+        if (isSafeExpression(node, allowedSymbols, ALLOWED_MATH_OPERATORS)) {
           const compiled = node.compile();
           evaluate = scope => compiled.evaluate(scope);
         } else {
@@ -154,5 +167,57 @@ export class MathExpressionCompiler {
       }
     }
     return evaluate;
+  }
+
+  compileCondition(
+    source: string,
+    vars: Record<string, number>,
+    coordinates: string[]
+  ): ((scope: Record<string, number>) => boolean) | null {
+    if (!source.trim()) return null;
+    if (/(^|[^\\])\b(?:abs|acos|asin|atan|ceil|cos|cosh|exp|floor|log|max|min|pow|round|sign|sin|sinh|sqrt|tan|tanh)\s*(?:\(|\{)/.test(source)) {
+      return null;
+    }
+
+    const normalizedSource = source
+      .replace(/\\(?:leq?|le)(?![a-zA-Z])/g, "<=")
+      .replace(/\\(?:geq?|ge)(?![a-zA-Z])/g, ">=")
+      .replace(/\\(?:neq|ne)(?![a-zA-Z])/g, "!=")
+      .replace(/\\(?:land|wedge)(?![a-zA-Z])/g, " and ")
+      .replace(/\\(?:lor|vee)(?![a-zA-Z])/g, " or ")
+      .replace(/(^|[^<>!=])=(?!=)/g, "$1==");
+    const cacheKey = `condition\u0000${normalizedSource}\u0000${Object.keys(vars).sort().join(",")}\u0000${coordinates.join(",")}`;
+    let evaluate = this.compiled.get(cacheKey);
+
+    if (evaluate === undefined) {
+      try {
+        const node = parse(normalizeExpression(normalizedSource));
+        const allowedSymbols = new Set(["e", "pi", ...coordinates, ...Object.keys(vars), ...ALLOWED_MATH_FUNCTIONS]);
+        if (isSafeExpression(node, allowedSymbols, ALLOWED_CONDITION_OPERATORS)) {
+          const compiled = node.compile();
+          evaluate = scope => compiled.evaluate(scope);
+        } else {
+          evaluate = null;
+        }
+      } catch {
+        evaluate = null;
+      }
+
+      this.compiled.set(cacheKey, evaluate);
+      if (this.compiled.size > 256) {
+        const oldestKey = this.compiled.keys().next().value as string | undefined;
+        if (oldestKey !== undefined) this.compiled.delete(oldestKey);
+      }
+    }
+
+    if (!evaluate) return null;
+    return scope => {
+      try {
+        const value = evaluate(scope);
+        return typeof value === "boolean" ? value : false;
+      } catch {
+        return false;
+      }
+    };
   }
 }

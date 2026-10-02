@@ -23,7 +23,8 @@ function createImplicitMesh(
   equation: string,
   variables: Record<string, number>,
   bounds: PlotBounds3D,
-  resolution: number
+  resolution: number,
+  conditionSource?: string
 ): { positions: Float32Array; indices: Uint32Array; bounds: PlotBounds3D } | null {
   const equalsIndex = equation.indexOf("=");
   if (equalsIndex <= 0 || equalsIndex !== equation.lastIndexOf("=")) return null;
@@ -33,11 +34,14 @@ function createImplicitMesh(
 
   const compiled = compiler.compile(`(${left}) - (${right})`, variables, ["x", "y", "z"]);
   if (!compiled) return null;
+  const condition = conditionSource ? compiler.compileCondition(conditionSource, variables, ["x", "y", "z"]) : null;
+  if (conditionSource && !condition) return null;
   const scope = { ...variables, x: 0, y: 0, z: 0 };
   const field = (x: number, y: number, z: number): number | null => {
     scope.x = x;
     scope.y = y;
     scope.z = z;
+    if (condition && !condition(scope)) return null;
     try {
       return finiteValue(compiled(scope));
     } catch {
@@ -71,18 +75,24 @@ function createImplicitMesh(
 
 function createExplicitEvaluator(
   expression: string,
-  variables: Record<string, number>
+  variables: Record<string, number>,
+  conditionSource?: string
 ): ((x: number, y: number) => number | null) | null {
   const source = expression.trim().replace(/^(z|f\([xXyY,\s]+\))\s*=\s*/i, "");
   const compiled = compiler.compile(source, variables, ["x", "y"]);
   if (!compiled) return null;
+  const condition = conditionSource ? compiler.compileCondition(conditionSource, variables, ["x", "y", "z"]) : null;
+  if (conditionSource && !condition) return null;
 
-  const scope = { ...variables, x: 0, y: 0 };
+  const scope = { ...variables, x: 0, y: 0, z: 0 };
   return (x: number, y: number) => {
     scope.x = x;
     scope.y = y;
     try {
-      return finiteValue(compiled(scope));
+      const value = finiteValue(compiled(scope));
+      if (value === null) return null;
+      scope.z = value;
+      return condition && !condition(scope) ? null : value;
     } catch {
       return null;
     }
@@ -141,9 +151,14 @@ function createExplicitMesh(
 }
 
 function findIntersections(
-  fields: Array<(x: number, y: number) => number | null>,
+  fields: Array<{
+    evaluate: (x: number, y: number) => number | null;
+    intersectionGroup?: number;
+    showIntersections?: boolean;
+  }>,
   bounds: PlotBounds3D,
-  resolution: number
+  resolution: number,
+  showAllIntersections: boolean
 ): Float32Array {
   const divisions = Math.max(12, Math.min(64, Math.round(resolution)));
   const [xMin, xMax, yMin, yMax] = bounds;
@@ -153,14 +168,20 @@ function findIntersections(
 
   for (let first = 0; first < fields.length; first++) {
     for (let second = first + 1; second < fields.length; second++) {
+      const fieldA = fields[first];
+      const fieldB = fields[second];
+      const enabledForGroup = fieldA.intersectionGroup !== undefined &&
+        fieldA.intersectionGroup === fieldB.intersectionGroup &&
+        fieldA.showIntersections && fieldB.showIntersections;
+      if (!showAllIntersections && !enabledForGroup) continue;
       const gridA: Array<number | null> = [];
       const gridB: Array<number | null> = [];
       for (let row = 0; row <= divisions; row++) {
         const y = yMin + row * stepY;
         for (let column = 0; column <= divisions; column++) {
           const x = xMin + column * stepX;
-          gridA.push(fields[first](x, y));
-          gridB.push(fields[second](x, y));
+          gridA.push(fieldA.evaluate(x, y));
+          gridB.push(fieldB.evaluate(x, y));
         }
       }
 
@@ -175,10 +196,10 @@ function findIntersections(
           const upperLeft = lowerLeft + divisions + 1;
           const upperRight = upperLeft + 1;
           const differences = [
-            gridA[lowerLeft] !== null && gridB[lowerLeft] !== null ? gridA[lowerLeft]! - gridB[lowerLeft]! : null,
-            gridA[lowerRight] !== null && gridB[lowerRight] !== null ? gridA[lowerRight]! - gridB[lowerRight]! : null,
-            gridA[upperRight] !== null && gridB[upperRight] !== null ? gridA[upperRight]! - gridB[upperRight]! : null,
-            gridA[upperLeft] !== null && gridB[upperLeft] !== null ? gridA[upperLeft]! - gridB[upperLeft]! : null
+            gridA[lowerLeft] !== null && gridB[lowerLeft] !== null ? gridA[lowerLeft] - gridB[lowerLeft] : null,
+            gridA[lowerRight] !== null && gridB[lowerRight] !== null ? gridA[lowerRight] - gridB[lowerRight] : null,
+            gridA[upperRight] !== null && gridB[upperRight] !== null ? gridA[upperRight] - gridB[upperRight] : null,
+            gridA[upperLeft] !== null && gridB[upperLeft] !== null ? gridA[upperLeft] - gridB[upperLeft] : null
           ];
           if (differences.some(value => value === null)) continue;
           const [d00, d10, d11, d01] = differences as [number, number, number, number];
@@ -197,8 +218,8 @@ function findIntersections(
           if (crossings.length < 2) continue;
           const firstPoint = crossings[0];
           const secondPoint = crossings[1];
-          const firstZ = fields[first](firstPoint[0], firstPoint[1]);
-          const secondZ = fields[first](secondPoint[0], secondPoint[1]);
+          const firstZ = fieldA.evaluate(firstPoint[0], firstPoint[1]);
+          const secondZ = fieldA.evaluate(secondPoint[0], secondPoint[1]);
           if (firstZ === null || secondZ === null) continue;
           segments.push(firstPoint[0], firstPoint[1], firstZ, secondPoint[0], secondPoint[1], secondZ);
         }
@@ -212,16 +233,24 @@ function findIntersections(
 function buildResponse(request: MeshRequest): MeshResponse {
   let bounds = request.bounds;
   const meshes: RenderedMeshData[] = [];
-  const explicitFields: Array<(x: number, y: number) => number | null> = [];
+  const explicitFields: Array<{
+    evaluate: (x: number, y: number) => number | null;
+    intersectionGroup?: number;
+    showIntersections?: boolean;
+  }> = [];
 
   request.items.forEach(item => {
     let mesh: { positions: Float32Array; indices: Uint32Array; bounds?: PlotBounds3D } | null;
     if (item.kind === "implicit") {
-      mesh = createImplicitMesh(item.expression, request.variables, bounds, request.resolution);
+      mesh = createImplicitMesh(item.expression, request.variables, bounds, request.resolution, item.condition);
     } else {
-      const field = createExplicitEvaluator(item.expression, request.variables);
+      const field = createExplicitEvaluator(item.expression, request.variables, item.condition);
       if (!field) return;
-      explicitFields.push(field);
+      explicitFields.push({
+        evaluate: field,
+        intersectionGroup: item.intersectionGroup,
+        showIntersections: item.showIntersections
+      });
       mesh = createExplicitMesh(field, bounds, request.resolution);
     }
     if (!mesh) return;
@@ -248,8 +277,8 @@ function buildResponse(request: MeshRequest): MeshResponse {
     });
   });
 
-  const intersections = request.showIntersections
-    ? findIntersections(explicitFields, bounds, request.resolution)
+  const intersections = request.showIntersections || explicitFields.some(field => field.showIntersections)
+    ? findIntersections(explicitFields, bounds, request.resolution, request.showIntersections)
     : new Float32Array(0);
   return { requestId: request.requestId, bounds, meshes, intersections: intersections.buffer as ArrayBuffer };
 }

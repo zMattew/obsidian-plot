@@ -98,6 +98,31 @@ test("explicit surface mesh contains only valid vertices and triangles", () => {
   }
 });
 
+test("explicit piecewise surface is clipped by its branch condition", () => {
+  const { response } = runWorker({
+    requestId: 3,
+    resolution: 16,
+    bounds: [-2, 2, -2, 2, -2, 2],
+    variables: {},
+    items: [{
+      id: 5,
+      kind: "explicit",
+      expression: "x",
+      condition: "z >= 0",
+      color: "#4caf50",
+      opacity: 1,
+      label: ""
+    }]
+  });
+
+  assert.equal(response.meshes.length, 1);
+  const positions = new Float32Array(response.meshes[0].positions);
+  assert.ok(positions.length > 0);
+  for (let index = 2; index < positions.length; index += 3) {
+    assert.ok(positions[index] >= 0);
+  }
+});
+
 test("intersection toggle returns line segments for crossing explicit surfaces", () => {
   const { response, transferredBuffers } = runWorker({
     requestId: 9,
@@ -118,5 +143,27 @@ test("intersection toggle returns line segments for crossing explicit surfaces",
   for (let index = 0; index < intersections.length; index += 3) {
     assert.ok(Math.abs(intersections[index]) < 0.0001);
     assert.ok(Math.abs(intersections[index + 2]) < 0.0001);
+  }
+});
+
+test("system intersection toggle only highlights equations in its own group", () => {
+  const { response } = runWorker({
+    requestId: 11,
+    resolution: 16,
+    bounds: [-2, 2, -2, 2, -2, 2],
+    variables: {},
+    showIntersections: false,
+    items: [
+      { id: 0, kind: "explicit", expression: "x", intersectionGroup: 4, showIntersections: true, color: "#e91e63", opacity: 1, label: "" },
+      { id: 1, kind: "explicit", expression: "-x", intersectionGroup: 4, showIntersections: true, color: "#4caf50", opacity: 1, label: "" },
+      { id: 2, kind: "explicit", expression: "y", color: "#2196f3", opacity: 1, label: "" },
+      { id: 3, kind: "explicit", expression: "-y", color: "#ff9800", opacity: 1, label: "" }
+    ]
+  });
+
+  const intersections = new Float32Array(response.intersections);
+  assert.ok(intersections.length > 0);
+  for (let index = 0; index < intersections.length; index += 3) {
+    assert.ok(Math.abs(intersections[index]) < 0.0001);
   }
 });

@@ -13,6 +13,7 @@
   display: flex;
   gap: 8px;
   align-items: center;
+  flex-wrap: wrap;
   position: relative;
   width: 100%;
 }
@@ -143,6 +144,31 @@
   pointer-events: none;
 }
 
+.math-canvas-label-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.math-render-buffer {
+  display: none;
+}
+
+.math-canvas-label {
+  position: absolute;
+  max-width: 240px;
+  padding: 2px 5px;
+  border: 1px solid;
+  border-radius: 4px;
+  background: rgba(18, 18, 18, 0.92);
+  font: 600 11px sans-serif;
+  line-height: 1.2;
+  white-space: nowrap;
+  user-select: none;
+}
+
 .math-webgl-label {
   padding: 2px 5px;
   border: 1px solid;
@@ -226,6 +252,8 @@
   border-radius: 4px;
   border: 1px solid var(--background-modifier-border);
   cursor: pointer;
+  background-color: var(--plot-color);
+  opacity: var(--plot-opacity, 1);
 }
 
 .math-color-popover {
@@ -304,6 +332,70 @@
   font-family: var(--font-monospace);
 }
 
+.math-piecewise-row {
+  align-items: flex-start;
+}
+
+.math-piecewise-row .math-row-body {
+  align-items: stretch;
+}
+
+.math-piecewise-editor {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.math-piecewise-branches {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.math-piecewise-branch {
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) minmax(120px, 1fr) auto;
+  gap: 5px;
+}
+
+.math-system-equation {
+  grid-template-columns: minmax(120px, 1fr) auto auto;
+}
+
+.math-system-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.math-system-options {
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.math-piecewise-branch input,
+.math-piecewise-latex {
+  min-width: 0;
+  font-family: var(--font-monospace);
+}
+
+.math-piecewise-tools {
+  display: flex;
+  gap: 5px;
+}
+
+.math-piecewise-latex {
+  width: 100%;
+  resize: vertical;
+}
+
+.math-piecewise-latex[aria-invalid="true"] {
+  border-color: var(--text-error);
+}
+
 .math-coordinate-input {
   width: 100%;
 }
@@ -343,6 +435,22 @@
   display: flex;
   align-items: center;
   gap: 8px;
+}
+
+@media (max-width: 700px) {
+  .math-piecewise-branch {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .math-piecewise-branch input:first-child,
+  .math-piecewise-branch input:nth-child(2) {
+    grid-column: 1;
+  }
+
+  .math-piecewise-branch button {
+    grid-column: 2;
+    grid-row: 1 / span 2;
+  }
 }
 
 .math-variable-badge {

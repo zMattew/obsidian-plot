@@ -4,6 +4,9 @@ export interface MeshRequestItem {
   id: number;
   kind: "explicit" | "implicit";
   expression: string;
+  condition?: string;
+  intersectionGroup?: number;
+  showIntersections?: boolean;
   color: string;
   opacity: number;
   label: string;

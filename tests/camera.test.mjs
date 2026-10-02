@@ -9,6 +9,7 @@ Module.prototype.require = function (id) {
   if (id === "obsidian") {
     return {
       Plugin: class {},
+      PluginSettingTab: class {},
       Modal: class {},
       MarkdownRenderChild: class {},
       TFile: class {},
@@ -55,6 +56,36 @@ test("parseConfig parses configuration with root locked: true", () => {
 
   const parsed = plugin.parseConfig(raw);
   assert.equal(parsed.locked, true);
+});
+
+test("parseConfig accepts vector fields, piecewise branches, and LaTeX systems", () => {
+  const plugin = new MultiPlotterPlugin();
+  const parsed = plugin.parseConfig(JSON.stringify({
+    type: "3d",
+    items: [
+      { type: "vectorField", components: "-y, x, 0", density: 5 },
+      { type: "piecewise", branches: [{ equation: "x + y", condition: "z >= 0" }] },
+      { type: "system", latex: "\\begin{aligned}x = 0\\\\y = 0\\\\z = 0\\end{aligned}" }
+    ]
+  }));
+
+  assert.equal(parsed.items[0].type, "vectorField");
+  assert.equal(parsed.items[1].type, "piecewise");
+  assert.equal(parsed.items[2].type, "system");
+  assert.equal(parsed.items[2].equations.length, 3);
+});
+
+test("parseConfig rejects piecewise surfaces in 2D and invalid vector-field density", () => {
+  const plugin = new MultiPlotterPlugin();
+
+  assert.throws(() => plugin.parseConfig(JSON.stringify({
+    type: "2d",
+    items: [{ type: "piecewise", branches: [{ equation: "x", condition: "x < 0" }] }]
+  })));
+  assert.throws(() => plugin.parseConfig(JSON.stringify({
+    type: "2d",
+    items: [{ type: "vectorField", components: "-y, x", density: 40 }]
+  })));
 });
 
 test("360-degree camera rotation can rotate fully without clamping", () => {

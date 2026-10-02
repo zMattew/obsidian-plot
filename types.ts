@@ -91,8 +91,52 @@ export interface PlotVector {
   visible?: boolean;
 }
 
+/** Sampled vector field with two or three comma-separated component expressions. */
+export interface PlotVectorField {
+  type: "vectorField";
+  components: string;
+  density?: number;
+  color?: HexColor;
+  label?: string;
+  visible?: boolean;
+}
+
+export interface PlotPiecewiseBranch {
+  equation: MathExpr;
+  condition: MathExpr;
+}
+
+/** Piecewise 3D surface defined by explicit or implicit equation-condition branches. */
+export interface PlotPiecewiseFunction {
+  type: "piecewise";
+  branches: PlotPiecewiseBranch[];
+  latex?: string;
+  color?: HexColor;
+  opacity?: number;
+  label?: string;
+  visible?: boolean;
+}
+
+export interface PlotSystemEquation {
+  equation: MathExpr;
+  visible?: boolean;
+}
+
+/** Grouped set of graphable equations with optional intersection and solution markers. */
+export interface PlotSystem {
+  type: "system";
+  equations: PlotSystemEquation[];
+  showIntersections?: boolean;
+  showSolutions?: boolean;
+  latex?: string;
+  color?: HexColor;
+  opacity?: number;
+  label?: string;
+  visible?: boolean;
+}
+
 /** Union of all entity items supported in a plot block. */
-export type PlotItem = PlotVariable | PlotFunction | PlotImplicitSurface | PlotPoint | PlotVector;
+export type PlotItem = PlotVariable | PlotFunction | PlotImplicitSurface | PlotPoint | PlotVector | PlotVectorField | PlotPiecewiseFunction | PlotSystem;
 
 // ============================================================================
 // CAMERA & AXES CONFIGURATION
