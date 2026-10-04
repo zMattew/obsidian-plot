@@ -698,10 +698,12 @@ export default class MultiPlotterPlugin extends Plugin {
     let webglUnavailable = false;
 
     const disableWebGL = (): void => {
-      state.meshWorker?.terminate();
+      const worker = state.meshWorker;
+      const renderer = state.webglRenderer;
       state.meshWorker = null;
-      state.webglRenderer?.dispose();
       state.webglRenderer = null;
+      worker?.terminate();
+      renderer?.dispose();
       state.webglMeshes = [];
       state.webglIntersections = new ArrayBuffer(0);
       state.meshRequestSignature = "";
@@ -734,6 +736,7 @@ export default class MultiPlotterPlugin extends Plugin {
         renderer.canvas.classList.toggle("is-locked", state.locked);
         renderer.canvas.addEventListener("webglcontextlost", event => {
           event.preventDefault();
+          if (state.webglRenderer !== renderer) return;
           webglUnavailable = true;
           disableWebGL();
         }, { once: true });
@@ -1772,10 +1775,12 @@ export default class MultiPlotterPlugin extends Plugin {
       if (saveTimer !== null) window.clearTimeout(saveTimer);
       window.clearTimeout(initialDrawTimer);
       resizeObserver.disconnect();
-      state.meshWorker?.terminate();
-      state.webglRenderer?.dispose();
+      const worker = state.meshWorker;
+      const renderer = state.webglRenderer;
       state.meshWorker = null;
       state.webglRenderer = null;
+      worker?.terminate();
+      renderer?.dispose();
     };
     if (ctx) {
       const renderChild = new MarkdownRenderChild(rootEl);
@@ -3053,10 +3058,10 @@ export default class MultiPlotterPlugin extends Plugin {
         worker.postMessage(request);
       } catch (error) {
         console.error("Could not send plot mesh request:", error);
-        worker.terminate();
         state.meshWorker = null;
-        renderer.dispose();
         state.webglRenderer = null;
+        worker.terminate();
+        renderer.dispose();
         state.webglMeshes = [];
         state.webglIntersections = new ArrayBuffer(0);
         canvas.classList.remove("math-hidden");

@@ -57,6 +57,7 @@ export class WebGLPlotRenderer {
   private axisLabels = new THREE.Group();
   private vectorLabels: Array<{ label: CSS2DObject; origin: THREE.Vector3; direction: THREE.Vector3 }> = [];
   private lastDecorationKey = "";
+  private disposed = false;
 
   constructor(container: HTMLElement) {
     this.renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true, powerPreference: "high-performance" });
@@ -177,6 +178,8 @@ export class WebGLPlotRenderer {
   }
 
   dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
     disposeGroup(this.meshes);
     disposeGroup(this.intersectionLines);
     disposeGroup(this.axes);
@@ -184,6 +187,7 @@ export class WebGLPlotRenderer {
     disposeGroup(this.meshLabels);
     disposeGroup(this.axisLabels);
     this.renderer.dispose();
+    this.renderer.forceContextLoss();
     this.labelRenderer.domElement.remove();
     this.canvas.remove();
   }
