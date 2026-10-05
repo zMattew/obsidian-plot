@@ -6,7 +6,7 @@ import test from "node:test";
 import { build } from "esbuild";
 
 const { outputFiles } = await build({
-  entryPoints: [fileURLToPath(new URL("../system-solver.ts", import.meta.url))],
+  entryPoints: [fileURLToPath(new URL("../src/system-solver.ts", import.meta.url))],
   bundle: true,
   platform: "node",
   format: "cjs",

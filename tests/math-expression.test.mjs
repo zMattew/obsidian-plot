@@ -5,7 +5,7 @@ import { runInNewContext } from "node:vm";
 import test from "node:test";
 import { transform } from "esbuild";
 
-const source = readFileSync(new URL("../math-expression.ts", import.meta.url), "utf8");
+const source = readFileSync(new URL("../src/math-expression.ts", import.meta.url), "utf8");
 const { code } = await transform(source, { loader: "ts", format: "cjs" });
 const expressionModule = { exports: {} };
 runInNewContext(code, {

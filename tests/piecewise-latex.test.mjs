@@ -4,7 +4,7 @@ import { runInNewContext } from "node:vm";
 import test from "node:test";
 import { transform } from "esbuild";
 
-const source = readFileSync(new URL("../piecewise-latex.ts", import.meta.url), "utf8");
+const source = readFileSync(new URL("../src/piecewise-latex.ts", import.meta.url), "utf8");
 const { code } = await transform(source, { loader: "ts", format: "cjs" });
 const piecewiseModule = { exports: {} };
 runInNewContext(code, { exports: piecewiseModule.exports, module: piecewiseModule });

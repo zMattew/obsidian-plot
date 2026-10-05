@@ -8,7 +8,8 @@
     "check": "tsc --noEmit",
     "lint": "eslint \"**/*.ts\"",
     "test": "npm run build && node --test tests/*.test.mjs",
-    "test:worker": "npm run build && node --test tests/plot-worker.test.mjs"
+    "test:worker": "npm run build && node --test tests/plot-worker.test.mjs",
+    "prepare": "npm run build"
   },
   "overrides": {
     "moment": "^2.31.0"
