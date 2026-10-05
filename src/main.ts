@@ -1,4 +1,5 @@
 import { App, finishRenderMath, MarkdownPostProcessorContext, MarkdownRenderChild, Modal, Plugin, PluginSettingTab, renderMath, Setting, TFile } from "obsidian";
+import type { SettingDefinitionItem } from "obsidian";
 import type { AxesVisibility, MathPlotConfig, PlotItem, PlotPiecewiseBranch, PlotSystemEquation } from "./types";
 import { ALLOWED_MATH_FUNCTIONS, MathExpressionCompiler } from "./math-expression";
 import { parsePiecewiseLatex, parseSystemLatex, serializePiecewiseLatex, serializeSystemLatex } from "./piecewise-latex";
@@ -3141,6 +3142,16 @@ class MathPlotModal extends Modal {
   }
 }
 
+const navigationActionNames: Array<[NavigationAction, string]> = [
+  ["zoomIn", "Zoom in"],
+  ["zoomOut", "Zoom out"],
+  ["panUp", "Pan up"],
+  ["panDown", "Pan down"],
+  ["panLeft", "Pan left"],
+  ["panRight", "Pan right"],
+  ["resetView", "Reset view"]
+];
+
 class PlotSettingsTab extends PluginSettingTab {
   private plugin: MultiPlotterPlugin;
 
@@ -3149,21 +3160,68 @@ class PlotSettingsTab extends PluginSettingTab {
     this.plugin = plugin;
   }
 
+  getSettingDefinitions(): SettingDefinitionItem[] {
+    return [{
+      type: "group",
+      heading: "Navigation",
+      items: [
+        ...navigationActionNames.map(([action, name]) => ({
+          name,
+          desc: "Key or modifier combination, e.g. Ctrl+ArrowUp",
+          control: { type: "text" as const, key: `keys.${action}` }
+        })),
+        {
+          name: "Zoom step",
+          desc: "Scale multiplier for each key press",
+          control: { type: "slider", key: "zoomFactor", min: 1.02, max: 1.5, step: 0.01 }
+        },
+        {
+          name: "Pan step",
+          desc: "Pixels moved for each key press",
+          control: { type: "slider", key: "panStep", min: 5, max: 80, step: 1 }
+        }
+      ]
+    }];
+  }
+
+  getControlValue(key: string): unknown {
+    const actionSetting = navigationActionNames.find(([action]) => key === `keys.${action}`);
+    if (actionSetting) {
+      return this.plugin.navigationSettings.keys[actionSetting[0]];
+    }
+    if (key === "zoomFactor" || key === "panStep") {
+      return this.plugin.navigationSettings[key];
+    }
+    throw new Error(`Unknown plot setting: ${key}`);
+  }
+
+  async setControlValue(key: string, value: unknown): Promise<void> {
+    const actionSetting = navigationActionNames.find(([action]) => key === `keys.${action}`);
+    if (actionSetting) {
+      if (typeof value !== "string") {
+        throw new TypeError(`Expected a string for plot setting: ${key}`);
+      }
+      this.plugin.navigationSettings.keys[actionSetting[0]] = value.trim();
+      await this.plugin.saveNavigationSettings();
+      return;
+    }
+    if (key === "zoomFactor" || key === "panStep") {
+      if (typeof value !== "number") {
+        throw new TypeError(`Expected a number for plot setting: ${key}`);
+      }
+      this.plugin.navigationSettings[key] = value;
+      await this.plugin.saveNavigationSettings();
+      return;
+    }
+    throw new Error(`Unknown plot setting: ${key}`);
+  }
+
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
     new Setting(containerEl).setName("Navigation").setHeading();
 
-    const actionNames: Array<[NavigationAction, string]> = [
-      ["zoomIn", "Zoom in"],
-      ["zoomOut", "Zoom out"],
-      ["panUp", "Pan up"],
-      ["panDown", "Pan down"],
-      ["panLeft", "Pan left"],
-      ["panRight", "Pan right"],
-      ["resetView", "Reset view"]
-    ];
-    actionNames.forEach(([action, name]) => {
+    navigationActionNames.forEach(([action, name]) => {
       new Setting(containerEl)
         .setName(name)
         .setDesc("Key or modifier combination, e.g. Ctrl+ArrowUp")

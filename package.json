@@ -1,6 +1,6 @@
 {
   "name": "obsidian-plot",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "private": true,
   "scripts": {
     "build": "npm run check && node scripts/build.mjs",
